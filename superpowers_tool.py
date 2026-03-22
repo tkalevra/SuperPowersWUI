@@ -165,6 +165,22 @@ Ask your first clarifying question now. One question only."""
         output += first_question
         return output + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
+    def start_spec(self, topic_and_summary: str) -> str:
+        """
+        Write a spec from a single combined string. Use this instead of write_spec
+        when the model has trouble with multi-argument tool calls.
+        Pass topic and design summary separated by '|||'.
+        Example: 'wren-watch ||| Python CLI tool that monitors directories...'
+        Trigger phrases: 'write the spec', 'save the spec', 'design approved'.
+
+        Args:
+            topic_and_summary: Topic slug and design summary joined by '|||'.
+        """
+        parts = topic_and_summary.split("|||", 1)
+        topic = parts[0].strip()
+        summary = parts[1].strip() if len(parts) > 1 else topic
+        return self.write_spec(topic, summary)
+
     def write_spec(self, topic: str, design_summary: str) -> str:
         """
         Saves the approved brainstorm design as a structured spec document, then
@@ -174,6 +190,7 @@ Ask your first clarifying question now. One question only."""
         Args:
             topic: Short slug for the feature (used in filename, e.g. 'user-auth').
             design_summary: Summary of the agreed design from the brainstorm conversation.
+        IMPORTANT: design_summary must be a single JSON string with all internal quotes and newlines properly escaped.
         """
         today = date.today().isoformat()
         slug = topic.lower().replace(" ", "-")
