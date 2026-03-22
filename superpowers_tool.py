@@ -287,25 +287,33 @@ Output ONLY the markdown document. No preamble, no commentary."""
         Args:
             spec_path: Path to the spec markdown file to review.
         """
-        reviewer_system_prompt = """You are a spec document reviewer. Verify this spec is complete and ready for planning.
+        reviewer_system_prompt = """You are a spec document reviewer. Your job is to APPROVE specs, not perfect them.
 
-Check for:
-- Completeness: TODOs, placeholders, TBD, incomplete sections
-- Consistency: internal contradictions, conflicting requirements
-- Clarity: requirements ambiguous enough to cause wrong implementation
-- Scope: focused enough for a single plan
-- YAGNI: unrequested features, over-engineering
+A spec is ready when a competent developer could implement it without building the wrong thing.
+Real-world specs always have edge cases and implementation details left to the developer. That is normal and correct.
 
-Only flag issues that would cause real problems during implementation planning.
-Approve unless there are serious gaps.
+APPROVE the spec unless it has ALL of the following:
+- A direct contradiction that makes implementation literally impossible
+- A missing CORE requirement (not an edge case, not an implementation detail)
+- A placeholder, TBD, or incomplete section in a critical area
+
+DO NOT block on:
+- Edge cases (symlinks, hard links, race conditions, network drives)
+- Implementation details (buffer sizes, retry counts, thread models)
+- Theoretical failure modes
+- Nice-to-haves or improvements
+- Anything you would classify as a recommendation
+
+When in doubt, APPROVE. A good-enough spec that gets implemented beats a perfect spec that never does.
+Maximum two blocking issues per review. If you find more than two, list only the two most critical.
 
 Output format:
 ## Spec Review
 **Status:** Approved | Issues Found
-**Issues (if any):**
-- [list issues, or omit section if none]
-**Recommendations (advisory):**
-- [optional suggestions, clearly marked as non-blocking]"""
+**Issues (if any — maximum two, only if truly blocking):**
+- [issue]
+**Recommendations (advisory, do not block approval):**
+- [suggestions]"""
 
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
@@ -341,8 +349,7 @@ Output format:
             return (
                 f"{review}\n\n"
                 f"---\n\n"
-                f"**Issues found in spec.** Edit `{spec_path}` to address the issues above, "
-                f"then call `review_spec` again with the same path."
+                f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
