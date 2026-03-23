@@ -565,12 +565,25 @@ Output format:
         plan_path, storage_mode, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
         plan_prompt = f"""CRITICAL: You are writing a TDD TASK PLAN, not an implementation.
-Do NOT write complete working implementations in the plan.
-Do NOT write fully functional classes or modules.
-DO write: task descriptions, failing test stubs showing the
-interface, acceptance criteria, and file/function names.
-Code examples in the plan should be minimal stubs only —
-enough to define the contract, not implement it.
+
+Code blocks in the plan are CONTRACTS only — they define what must
+be built, not how. Every code block must follow these rules:
+
+STUBS ONLY — a stub is:
+- A function/class signature with `pass` or
+  `raise NotImplementedError`
+- A test with a single `assert False, "not yet implemented"` body
+- An import block showing expected module structure
+
+NEVER write in a plan code block:
+- Any loop (for, while)
+- Any conditional logic (if/elif/else) beyond type guards
+- Any complete function body beyond pass/raise NotImplementedError
+- More than 5 lines of executable code per block
+- Working implementations, algorithms, or business logic
+
+If you find yourself writing real logic, stop and replace it
+with a stub. The test execution phase writes real code.
 
 You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
@@ -741,7 +754,7 @@ Check for:
 - Spec Alignment: plan covers spec requirements, no major scope creep
 - Task Decomposition: tasks have clear boundaries, steps are actionable
 - Buildability: could an engineer follow this without getting stuck?
-- Code examples: treat all code blocks as illustrative — do not block on code quality, completeness, or style
+- Stub enforcement: BLOCK if any single code block contains a loop (for/while), conditional logic beyond type guards, more than 5 lines of executable code, or a complete working implementation. Stubs with pass/raise NotImplementedError and test skeletons with assert False are correct and expected.
 
 Only flag issues that would cause real problems during implementation.
 Approve unless there are serious gaps.
@@ -791,7 +804,12 @@ Output format:
             if self._plan_revision_count >= self.MAX_PLAN_REVISIONS:
                 self._plan_revision_count = 0
                 review = review.replace("BLOCKED", "APPROVED")
-                review += "\n\n> **Force-approved after reaching maximum revision limit.**"
+                review += (
+                    "\n\n[SUPERPOWERS:WARNING] Plan force-approved after "
+                    f"{self.MAX_PLAN_REVISIONS} revision attempts. "
+                    "Remaining issues are advisory — address during "
+                    "execution if tests fail."
+                )
                 approved = True
 
         if self._mode == "ask":
@@ -910,16 +928,31 @@ Output format:
         task_block = "\n".join(task_lines).strip()
 
         tdd_system_prompt = (
-            f"You are executing TDD implementation task {task_number} from a plan.\n\n"
-            "Strict TDD rules:\n"
-            "1. Write the failing test FIRST — no implementation code yet\n"
-            "2. Run the test and confirm it FAILS (this proves the test is real)\n"
-            "3. Write the MINIMAL implementation to make the test pass\n"
-            "4. Run the test again and confirm it PASSES\n"
-            "5. Commit with the exact git commands specified in the task\n\n"
-            "Do not skip steps. Do not write implementation before the test exists.\n"
-            "Do not auto-advance to the next task when done — report completion and wait.\n\n"
-            f"Plan file: {plan_path}"
+            f"You are executing TDD task {task_number}. This is a two-phase\n"
+            "process. You are in PHASE 1: TEST WRITING ONLY.\n\n"
+            "PHASE 1 — Write the failing test:\n"
+            "1. Read the task stub carefully — it defines the interface contract\n"
+            "2. Write the complete test file for this task\n"
+            "3. The test must import from the module path specified in the task\n"
+            "4. Every assertion must be meaningful — no assert True or assert False\n"
+            "5. Output the complete test file content and nothing else\n"
+            "6. Do NOT write any implementation code in this phase\n"
+            "7. End your response with exactly: [SUPERPOWERS:PHASE1:DONE]\n\n"
+            "After PHASE 1 is confirmed, PHASE 2 will write the implementation\n"
+            "to make those tests pass.\n\n"
+            "Before writing, check if a knowledge base is available with\n"
+            "project context or coding standards. If list_knowledge_bases or\n"
+            "query_knowledge_files tools are available, query them for relevant\n"
+            "patterns before writing. If no knowledge base tools are available,\n"
+            "proceed without them.\n\n"
+            "Security checklist — flag any of these in the task if present:\n"
+            "- Path traversal risk (unvalidated user-supplied paths)\n"
+            "- Missing import statements that would cause NameError on run\n"
+            "- Duplicate class or function definitions\n"
+            "- Resource handles opened without context managers\n"
+            "- Unbounded loops with no exit condition\n\n"
+            f"Plan file: {plan_path}\n"
+            f"Task: {task_number}"
         )
 
         result = await self._run_sub_agent(
@@ -935,6 +968,47 @@ Output format:
             __chat_id__=__chat_id__,
             __message_id__=__message_id__,
         )
+
+        if "[SUPERPOWERS:PHASE1:DONE]" in result:
+            phase2_system_prompt = (
+                "You are in PHASE 2: IMPLEMENTATION.\n\n"
+                "The test file from Phase 1 defines the contract. Write the\n"
+                "minimal implementation to make every test pass.\n\n"
+                "Rules:\n"
+                "- Write only what is needed to pass the tests — no extras\n"
+                "- Every import in the implementation must be explicit\n"
+                "- No duplicate class or function definitions\n"
+                "- Use context managers for all file and resource handles\n"
+                "- Validate all user-supplied paths before use (os.path.abspath,\n"
+                "  Path.resolve(), existence checks)\n"
+                "- No bare except clauses — catch specific exceptions\n"
+                "- After writing the implementation, output the git commit\n"
+                "  commands specified in the task\n\n"
+                "Before writing, check if a knowledge base is available with\n"
+                "project context or coding standards. If list_knowledge_bases or\n"
+                "query_knowledge_files tools are available, query them for\n"
+                "relevant patterns before writing. If no knowledge base tools\n"
+                "are available, proceed without them.\n\n"
+                "End your response with: [SUPERPOWERS:PHASE2:DONE]\n\n"
+                f"Plan file: {plan_path}\n"
+                f"Task: {task_number}"
+            )
+            phase2_result = await self._run_sub_agent(
+                system_prompt=phase2_system_prompt,
+                user_prompt=f"Phase 1 test output:\n\n{result}\n\nNow write the implementation.",
+                description=f"Implementing task {task_number}",
+                __request__=__request__,
+                __user__=__user__,
+                __metadata__=__metadata__,
+                __model__=__model__,
+                __event_emitter__=__event_emitter__,
+                __event_call__=__event_call__,
+                __chat_id__=__chat_id__,
+                __message_id__=__message_id__,
+            )
+            combined_result = result + "\n\n---\n\n" + phase2_result
+        else:
+            combined_result = result
 
         tdd_context = (
             f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
@@ -952,7 +1026,7 @@ Output format:
             f"## Task {task_number} Content\n\n"
             f"{task_block}\n\n"
             f"---\n\n"
-            f"{result}\n\n"
+            f"{combined_result}\n\n"
             f"**Tip:** If Fileshed is installed, verify the plan file with:\n"
             f"`shed_exec(zone=\"storage\", path=\"superpowers/plans/{os.path.basename(plan_path)}\", cmd=\"cat\")`"
         )
