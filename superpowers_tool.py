@@ -85,20 +85,6 @@ class Tools:
         self.valves = self.Valves()
 
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
-        """
-        Resolves a full file path for persistent storage.
-
-        If FILESHED_COMPATIBLE is True and user_id is provided:
-            Path: {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/{subdir}/{filename}
-            Files appear in Fileshed's Storage zone under superpowers/
-
-        If FILESHED_COMPATIBLE is False or user_id is empty:
-            Path: {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
-            Fallback for standalone use without Fileshed.
-
-        Creates the directory if it does not exist.
-        Returns: tuple (path, storage_mode) where storage_mode is 'fileshed' or 'standalone'.
-        """
         if self.valves.FILESHED_COMPATIBLE and user_id:
             base = os.path.join(
                 self.valves.STORAGE_BASE_PATH,
