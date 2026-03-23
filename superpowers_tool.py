@@ -517,6 +517,7 @@ Output format:
         self,
         spec_path: str,
         feature_name: str,
+        revision_notes: str = "",
         __user__: dict = None,
         __metadata__: dict = None,
         __event_emitter__: typing.Callable[[dict], typing.Any] = None,
@@ -618,14 +619,18 @@ git commit -m "feat: [what this task implements]"
 
 Output ONLY the markdown document. No preamble, no commentary."""
 
+        user_prompt = (
+            f"Feature: {feature_name}\n\n"
+            f"Spec content:\n\n{spec_content}\n\n"
+            f"Write the complete implementation plan now. Cover every requirement in the spec. "
+            f"Do not stop until all tasks are written."
+        )
+        if revision_notes:
+            user_prompt += f"\n\n## Revision Notes (address these before finalizing):\n{revision_notes}"
+
         plan_content = await self._run_sub_agent(
             system_prompt=plan_prompt,
-            user_prompt=(
-                f"Feature: {feature_name}\n\n"
-                f"Spec content:\n\n{spec_content}\n\n"
-                f"Write the complete implementation plan now. Cover every requirement in the spec. "
-                f"Do not stop until all tasks are written."
-            ),
+            user_prompt=user_prompt,
             description="Writing plan",
             __request__=__request__,
             __user__=__user__,
@@ -786,9 +791,9 @@ Output format:
                     f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                     f"{review}\n\n"
                     f"---\n\n"
-                    f"**Issues found in plan.** Edit `{plan_path}` to address the issues above, "
-                    f"then call `review_plan` again with the same path."
-                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call review_plan again."
+                    f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
+                    f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
+                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Call write_plan again with revision_notes."
                 )
 
         # cook mode
@@ -812,8 +817,8 @@ Output format:
                 f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                 f"{review}\n\n"
                 f"---\n\n"
-                f"**Issues found in plan.** Edit `{plan_path}` to address the issues above, "
-                f"then call `review_plan` again with the same path."
+                f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
+                f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
