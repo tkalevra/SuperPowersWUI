@@ -63,13 +63,10 @@ class Tools:
             ),
         )
 
-    _mode: str = "ask"
-    _mode_set: bool = False
-    MAX_PLAN_REVISIONS: int = 2
-    _plan_revision_count: int = 0
-
     def __init__(self):
         self.valves = self.Valves()
+        self.MAX_PLAN_REVISIONS = 2
+        self._plan_revision_count = 0
 
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
         if self.valves.FILESHED_COMPATIBLE and user_id:
@@ -88,6 +85,26 @@ class Tools:
         path = os.path.join(base, filename)
         zone_relative_path = f"superpowers/{subdir}/{filename}" if storage_mode == "fileshed" else ""
         return path, storage_mode, zone_relative_path
+
+    def _get_mode(self, messages: list = None) -> str:
+        """
+        Resolve current mode from conversation history.
+        Scans all messages for the most recent [SUPERPOWERS:MODE:*]
+        tag and returns "cook" or "ask". Defaults to "ask" if no
+        tag found.
+        """
+        if not messages:
+            return "ask"
+        for msg in reversed(messages):
+            content = ""
+            if isinstance(msg, dict):
+                c = msg.get("content", "")
+                content = c if isinstance(c, str) else ""
+            if "[SUPERPOWERS:MODE:COOK]" in content:
+                return "cook"
+            if "[SUPERPOWERS:MODE:ASK]" in content:
+                return "ask"
+        return "ask"
 
     # -------------------------------------------------------------------------
     # Sub-agent helper
@@ -147,6 +164,7 @@ class Tools:
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Initiates the Superpowers brainstorming phase for a new feature or project idea.
@@ -163,23 +181,31 @@ class Tools:
         # Mode detection
         idea_lower = idea.lower()
         if "cook" in idea_lower:
-            self._mode = "cook"
-            self._mode_set = True
+            mode_tag = "[SUPERPOWERS:MODE:COOK]"
+            mode = "cook"
         elif "ask" in idea_lower:
-            self._mode = "ask"
-            self._mode_set = True
-        elif not self._mode_set:
-            self._mode_set = True
-            msg = (
-                "Ready to build. Two modes:\n\n**Cook** — I run autonomously to "
-                "completion. No interruptions unless something breaks.\n\n**Ask** — "
-                "I pause at each phase for your approval before continuing.\n\nSay "
-                "**cook** to go hands-off, or **ask** if you want control. "
-                "You can switch anytime by saying either word."
-            )
-            if __event_emitter__:
-                await __event_emitter__({"type": "message", "data": {"content": msg}})
-            return msg
+            mode_tag = "[SUPERPOWERS:MODE:ASK]"
+            mode = "ask"
+        else:
+            mode = self._get_mode(__messages__)
+            mode_tag = f"[SUPERPOWERS:MODE:{mode.upper()}]"
+
+        # First-time prompt: show only if no mode tag found in history
+        if not __messages__ or not any(
+            "[SUPERPOWERS:MODE:" in (m.get("content", "") if isinstance(m, dict) else "")
+            for m in (__messages__ or [])
+        ):
+            if "cook" not in idea_lower and "ask" not in idea_lower:
+                msg = (
+                    "Ready to build. Two modes:\n\n**Cook** — I run autonomously to "
+                    "completion. No interruptions unless something breaks.\n\n**Ask** — "
+                    "I pause at each phase for your approval before continuing.\n\nSay "
+                    "**cook** to go hands-off, or **ask** if you want control. "
+                    "You can switch anytime by saying either word."
+                )
+                if __event_emitter__:
+                    await __event_emitter__({"type": "message", "data": {"content": msg}})
+                return msg + "\n\n[SUPERPOWERS:MODE:ASK]"
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Brainstorming...", "done": False}})
@@ -204,7 +230,7 @@ class Tools:
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+        return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input.\n" + mode_tag
 
     async def start_spec(
         self,
@@ -217,6 +243,7 @@ class Tools:
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Write a spec from a single combined string. Use this instead of write_spec
@@ -243,7 +270,7 @@ class Tools:
             topic, summary,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
-            __chat_id__=__chat_id__, __message_id__=__message_id__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
 
     async def write_spec(
@@ -258,6 +285,7 @@ class Tools:
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Saves the approved brainstorm design as a structured spec document, then
@@ -370,7 +398,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
 
-        if self._mode == "ask":
+        if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
@@ -378,6 +406,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"**Spec saved:** `{spec_path}`\n"
                 f"**Storage:** {storage_label}\n\n"
                 f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Spec written. Reply **cook** to continue to review, or give feedback to revise."
+                f"\n[SUPERPOWERS:MODE:ASK]"
             )
 
         # cook mode: auto-review
@@ -391,12 +420,12 @@ Output ONLY the markdown document. No preamble, no commentary."""
             spec_path,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
-            __chat_id__=__chat_id__, __message_id__=__message_id__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
         output += review_result
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return output
+        return output + "\n[SUPERPOWERS:MODE:COOK]"
 
     async def review_spec(
         self,
@@ -409,6 +438,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Runs a sub-agent reviewer pass against a saved spec document.
@@ -483,7 +513,7 @@ Output format:
 
         approved = "BLOCKED" not in review
 
-        if self._mode == "ask":
+        if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             if approved:
@@ -493,6 +523,7 @@ Output format:
                     f"**Spec is approved.** Review the full document at:\n"
                     f"`{spec_path}`\n\n"
                     f"[SUPERPOWERS:PHASE:COMPLETE] Spec approved. Reply **cook** to continue to plan, or give feedback to revise."
+                    f"\n[SUPERPOWERS:MODE:ASK]"
                 )
             else:
                 return (
@@ -500,6 +531,7 @@ Output format:
                     f"---\n\n"
                     f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
                     f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call review_spec again."
+                    f"\n[SUPERPOWERS:MODE:ASK]"
                 )
 
         # cook mode
@@ -513,6 +545,7 @@ Output format:
                 f"`{spec_path}`\n\n"
                 f"When ready, say **\"write the plan\"** and provide the spec path."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                f"\n[SUPERPOWERS:MODE:COOK]"
             )
         else:
             if __event_emitter__:
@@ -522,6 +555,7 @@ Output format:
                 f"---\n\n"
                 f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                f"\n[SUPERPOWERS:MODE:COOK]"
             )
 
     async def write_plan(
@@ -537,6 +571,7 @@ Output format:
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Reads an approved spec and generates a detailed TDD implementation plan,
@@ -703,7 +738,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
 
-        if self._mode == "ask":
+        if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
@@ -711,6 +746,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"**Plan saved:** `{plan_path}`\n"
                 f"**Storage:** {storage_label}\n\n"
                 f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Plan written. Reply **cook** to continue to review, or give feedback to revise."
+                f"\n[SUPERPOWERS:MODE:ASK]"
             )
 
         # cook mode: auto-review
@@ -724,12 +760,12 @@ Output ONLY the markdown document. No preamble, no commentary."""
             plan_path,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
-            __chat_id__=__chat_id__, __message_id__=__message_id__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
         output += review_result
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return output
+        return output + "\n[SUPERPOWERS:MODE:COOK]"
 
     async def review_plan(
         self,
@@ -742,6 +778,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Runs a sub-agent reviewer pass against a saved implementation plan.
@@ -821,7 +858,7 @@ Output format:
                 )
                 approved = True
 
-        if self._mode == "ask":
+        if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             if approved:
@@ -832,6 +869,7 @@ Output format:
                     f"**Plan is approved and ready for execution.**\n\n"
                     f"Plan file: `{plan_path}`\n\n"
                     f"[SUPERPOWERS:PHASE:COMPLETE] Plan approved. Reply **cook** to begin execution, or give feedback to revise."
+                    f"\n[SUPERPOWERS:MODE:ASK]"
                 )
             else:
                 return (
@@ -841,6 +879,7 @@ Output format:
                     f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
                     f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
                     f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Call write_plan again with revision_notes."
+                    f"\n[SUPERPOWERS:MODE:ASK]"
                 )
 
         # cook mode
@@ -856,6 +895,7 @@ Output format:
                 f"To begin, say **\"execute task 1\"** with the plan path. "
                 f"You control the pace — tasks are executed one at a time."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                f"\n[SUPERPOWERS:MODE:COOK]"
             )
         else:
             if __event_emitter__:
@@ -867,6 +907,7 @@ Output format:
                 f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
                 f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                f"\n[SUPERPOWERS:MODE:COOK]"
             )
 
     async def execute_task(
@@ -881,6 +922,7 @@ Output format:
         __event_call__=None,
         __chat_id__: str = "",
         __message_id__: str = "",
+        __messages__: list = None,
     ) -> str:
         """
         Loads a specific task from an approved plan and executes it via TDD sub-agent.
@@ -1055,4 +1097,9 @@ Output format:
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return tdd_context + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+        mode = self._get_mode(__messages__)
+        return (
+            tdd_context
+            + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
+        )
