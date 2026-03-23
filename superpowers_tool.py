@@ -69,34 +69,51 @@ class Tools:
                 "retrieve. Override for non-Docker installs or custom paths."
             ),
         )
+        FILESHED_COMPATIBLE: bool = Field(
+            default=True,
+            description=(
+                "Set True if Fileshed is installed alongside this tool (recommended). "
+                "Files will be written to {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/ "
+                "and appear automatically in your Fileshed Storage zone. "
+                "Set False for standalone use without Fileshed — files go to "
+                "{STORAGE_BASE_PATH}/superpowers/ instead. "
+                "Both tools must have matching storage_base_path valve values."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
 
-    def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> str:
+    def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
         """
-        Resolves a full file path under the persistent storage base.
+        Resolves a full file path for persistent storage.
+
+        If FILESHED_COMPATIBLE is True and user_id is provided:
+            Path: {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/{subdir}/{filename}
+            Files appear in Fileshed's Storage zone under superpowers/
+
+        If FILESHED_COMPATIBLE is False or user_id is empty:
+            Path: {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
+            Fallback for standalone use without Fileshed.
+
         Creates the directory if it does not exist.
-        If user_id is provided, uses Fileshed-compatible layout:
-          {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/{subdir}/{filename}
-        Otherwise falls back to flat path (no user scoping, works without Fileshed):
-          {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
+        Returns: tuple (path, storage_mode) where storage_mode is 'fileshed' or 'standalone'.
         """
-        if user_id:
-            # Fileshed-compatible path: appears in Fileshed Storage zone
+        if self.valves.FILESHED_COMPATIBLE and user_id:
             base = os.path.join(
                 self.valves.STORAGE_BASE_PATH,
                 "users", user_id, "Storage", "data", "superpowers", subdir
             )
+            storage_mode = "fileshed"
         else:
-            # Fallback: flat path under storage base, no user scoping
-            # Works without Fileshed or when user context unavailable
             base = os.path.join(
                 self.valves.STORAGE_BASE_PATH,
                 "superpowers", subdir
             )
+            storage_mode = "standalone"
         os.makedirs(base, exist_ok=True)
-        return os.path.join(base, filename)
+        path = os.path.join(base, filename)
+        return path, storage_mode
 
     # -------------------------------------------------------------------------
     # Internal helper
@@ -163,7 +180,7 @@ class Tools:
     # Tool functions
     # -------------------------------------------------------------------------
 
-    def brainstorm(self, idea: str) -> str:
+    async def brainstorm(self, idea: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Initiates the Superpowers brainstorming phase for a new feature or project idea.
         Enforces the HARD-GATE: no code until a spec is approved.
@@ -207,7 +224,7 @@ Ask your first clarifying question now. One question only."""
         output += first_question
         return output + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
-    def start_spec(self, topic_and_summary: str) -> str:
+    async def start_spec(self, topic_and_summary: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Write a spec from a single combined string. Use this instead of write_spec
         when the model has trouble with multi-argument tool calls.
@@ -221,9 +238,9 @@ Ask your first clarifying question now. One question only."""
         parts = topic_and_summary.split("|||", 1)
         topic = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else topic
-        return self.write_spec(topic, summary)
+        return await self.write_spec(topic, summary, __user__, __metadata__)
 
-    def write_spec(self, topic: str, design_summary: str) -> str:
+    async def write_spec(self, topic: str, design_summary: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Saves the approved brainstorm design as a structured spec document, then
         automatically runs a subagent reviewer pass against it.
@@ -238,7 +255,7 @@ Ask your first clarifying question now. One question only."""
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
-        spec_path = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
+        spec_path, storage_mode = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
 
         spec_prompt = f"""You are writing a structured software spec document.
 
@@ -313,15 +330,15 @@ Output ONLY the markdown document. No preamble, no commentary."""
         output = (
             f"[SUPERPOWERS:PHASE:SPEC_REVIEW]\n\n"
             f"**Spec saved:** `{spec_path}`\n"
-            f"**Storage mode:** {'Fileshed-compatible (user-scoped)' if user_id else 'Fallback (flat path)'}\n\n"
+            f"**Storage:** {'Fileshed Storage zone (superpowers/)' if storage_mode == 'fileshed' else 'Standalone path'}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
 
-        review_result = self.review_spec(spec_path)
+        review_result = await self.review_spec(spec_path)
         output += review_result
         return output
 
-    def review_spec(self, spec_path: str) -> str:
+    async def review_spec(self, spec_path: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Runs an isolated subagent reviewer pass against a saved spec document.
         Makes a direct HTTP call with no conversation history — pure document review.
@@ -395,7 +412,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    def write_plan(self, spec_path: str, feature_name: str) -> str:
+    async def write_plan(self, spec_path: str, feature_name: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Reads an approved spec and generates a detailed TDD implementation plan,
         then automatically runs a subagent reviewer pass against it.
@@ -419,7 +436,7 @@ Output format:
         slug = feature_name.lower().replace(" ", "-")
         filename = f"{today}-{slug}.md"
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
-        plan_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
+        plan_path, storage_mode = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
         plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
@@ -519,15 +536,15 @@ Output ONLY the markdown document. No preamble, no commentary."""
         output = (
             f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
             f"**Plan saved:** `{plan_path}`\n"
-            f"**Storage mode:** {'Fileshed-compatible (user-scoped)' if user_id else 'Fallback (flat path)'}\n\n"
+            f"**Storage:** {'Fileshed Storage zone (superpowers/)' if storage_mode == 'fileshed' else 'Standalone path'}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
 
-        review_result = self.review_plan(plan_path)
+        review_result = await self.review_plan(plan_path)
         output += review_result
         return output
 
-    def review_plan(self, plan_path: str) -> str:
+    async def review_plan(self, plan_path: str, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Runs an isolated subagent reviewer pass against a saved implementation plan.
         Makes a direct HTTP call with no conversation history — pure document review.
@@ -596,7 +613,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    def execute_task(self, plan_path: str, task_number: int) -> str:
+    async def execute_task(self, plan_path: str, task_number: int, __user__: dict = None, __metadata__: dict = None) -> str:
         """
         Loads a specific task from an approved plan and injects TDD execution context.
         Does NOT auto-advance — you control the pace, one task at a time.
@@ -669,6 +686,9 @@ Output format:
 
 ---
 
-Begin with Step 1: write the failing test. Show the complete test code."""
+Begin with Step 1: write the failing test. Show the complete test code.
+
+**Tip:** If Fileshed is installed, verify the plan file with:
+`shed_exec(zone="storage", path="superpowers/plans/{os.path.basename(plan_path)}", cmd="cat")`"""
 
         return tdd_context + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."

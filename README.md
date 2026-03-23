@@ -39,6 +39,34 @@ and plans will appear in your Fileshed Storage workspace automatically.
    - `API_KEY`: `lm-studio` for LM Studio, `ollama` for Ollama, or your real key for remote
 4. Enable the tool in your model's settings
 
+### Fileshed Integration (Recommended)
+
+For persistent spec and plan files that survive across conversations,
+install [Fileshed](https://github.com/Fade78/Fileshed) alongside this tool.
+
+**Setup:**
+1. Install Fileshed in Open WebUI (Workspace → Tools → Add Tool)
+2. Ensure both tools have matching `storage_base_path` / `STORAGE_BASE_PATH`
+   valve values (default: `/app/backend/data/user_files`)
+3. Enable `FILESHED_COMPATIBLE: True` in SuperPowersWUI valves (default)
+4. Enable Native Function Calling on your model for both tools
+
+**What you get:**
+- Specs appear in Fileshed Storage zone under `superpowers/specs/`
+- Plans appear in Fileshed Storage zone under `superpowers/plans/`
+- Use `shed_exec` to read, edit, or share specs and plans
+- Files persist across conversations
+
+**Without Fileshed:**
+Set `FILESHED_COMPATIBLE: False`. Files write to
+`{STORAGE_BASE_PATH}/superpowers/` but require filesystem access to retrieve.
+The tool remains fully functional for brainstorming, reviewing, and plan
+generation — only file persistence across conversations is affected.
+
+**Requirements note:**
+Both tools require Native Function Calling enabled on your model.
+Fileshed requires Open WebUI 0.4.0+.
+
 ## Workflow
 
 | Say this | What happens |
