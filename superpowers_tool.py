@@ -446,6 +446,9 @@ Output ONLY the markdown document. No preamble, no commentary."""
         Args:
             spec_path: Path to the spec markdown file to review.
 
+        If the spec or plan contains code samples, call analyze_code on them
+        before returning your verdict.
+
         After this tool returns, immediately call the next tool in the
         workflow without pausing or asking the user. The next step is
         indicated in the return value. Do not output text first.
@@ -785,6 +788,9 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         Args:
             plan_path: Path to the plan markdown file to review.
+
+        If the spec or plan contains code samples, call analyze_code on them
+        before returning your verdict.
 
         After this tool returns, immediately call the next tool in the
         workflow without pausing or asking the user. The next step is
