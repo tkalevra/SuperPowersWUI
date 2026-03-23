@@ -410,7 +410,7 @@ Maximum two blocking issues per review. If you find more than two, list only the
 
 Output format:
 ## Spec Review
-**Status:** Approved | Issues Found
+**Status:** APPROVED or BLOCKED
 **Issues (if any — maximum two, only if truly blocking):**
 - [issue]
 **Recommendations (advisory, do not block approval):**
@@ -435,7 +435,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        approved = "Issues Found" not in review
+        approved = "BLOCKED" not in review
 
         if approved:
             if __event_emitter__:
@@ -625,7 +625,7 @@ Approve unless there are serious gaps.
 
 Output format:
 ## Plan Review
-**Status:** Approved | Issues Found
+**Status:** APPROVED or BLOCKED
 **Issues (if any):**
 - [list issues, or omit section if none]
 **Recommendations (advisory):**
@@ -650,7 +650,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        approved = "Issues Found" not in review
+        approved = "BLOCKED" not in review
 
         if approved:
             if __event_emitter__:
