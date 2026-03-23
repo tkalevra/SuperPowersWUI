@@ -84,7 +84,8 @@ class Tools:
             storage_mode = "standalone"
         os.makedirs(base, exist_ok=True)
         path = os.path.join(base, filename)
-        return path, storage_mode
+        zone_relative_path = f"superpowers/{subdir}/{filename}" if storage_mode == "fileshed" else ""
+        return path, storage_mode, zone_relative_path
 
     # -------------------------------------------------------------------------
     # Sub-agent helper
@@ -276,7 +277,7 @@ class Tools:
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
-        spec_path, storage_mode = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
+        spec_path, storage_mode, zone_relative_path = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
 
         spec_prompt = f"""You are writing a structured software spec document.
 
@@ -439,11 +440,14 @@ Output format:
 **Recommendations (advisory, do not block approval):**
 - [suggestions]"""
 
+        user_id = (__user__ or {}).get("id", "")
+        resolved_path, _, zone_relative_path = self._resolve_path(self.valves.SPEC_DIR, os.path.basename(spec_path), user_id)
+        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else spec_path
         try:
-            with open(spec_path, "r", encoding="utf-8") as f:
+            with open(read_path, "r", encoding="utf-8") as f:
                 spec_content = f.read()
         except OSError as e:
-            return f"ERROR: Could not read spec file `{spec_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            return f"ERROR: Could not read spec file `{read_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
         review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
@@ -537,13 +541,16 @@ Output format:
         """
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Writing plan...", "done": False}})
+        user_id = (__user__ or {}).get("id", "")
+        resolved_spec, _, spec_zone_path = self._resolve_path(self.valves.SPEC_DIR, os.path.basename(spec_path), user_id)
+        read_spec_path = resolved_spec if (self.valves.FILESHED_COMPATIBLE and spec_zone_path) else spec_path
         try:
-            with open(spec_path, "r", encoding="utf-8") as f:
+            with open(read_spec_path, "r", encoding="utf-8") as f:
                 spec_content = f.read()
         except OSError as e:
             return (
                 f"[SUPERPOWERS:PHASE:PLAN_ERROR]\n\n"
-                f"Could not read spec file `{spec_path}`: {e}"
+                f"Could not read spec file `{read_spec_path}`: {e}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -551,7 +558,7 @@ Output format:
         slug = feature_name.lower().replace(" ", "-")
         filename = f"{today}-{slug}.md"
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
-        plan_path, storage_mode = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
+        plan_path, storage_mode, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
         plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
@@ -730,11 +737,14 @@ Output format:
 **Recommendations (advisory):**
 - [optional suggestions, clearly marked as non-blocking]"""
 
+        user_id = (__user__ or {}).get("id", "")
+        resolved_path, _, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, os.path.basename(plan_path), user_id)
+        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else plan_path
         try:
-            with open(plan_path, "r", encoding="utf-8") as f:
+            with open(read_path, "r", encoding="utf-8") as f:
                 plan_content = f.read()
         except OSError as e:
-            return f"ERROR: Could not read plan file `{plan_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            return f"ERROR: Could not read plan file `{read_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
         review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
@@ -835,13 +845,16 @@ Output format:
         """
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Executing task...", "done": False}})
+        user_id = (__user__ or {}).get("id", "")
+        resolved_path, _, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, os.path.basename(plan_path), user_id)
+        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else plan_path
         try:
-            with open(plan_path, "r", encoding="utf-8") as f:
+            with open(read_path, "r", encoding="utf-8") as f:
                 plan_content = f.read()
         except OSError as e:
             return (
                 f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
-                f"ERROR: Could not read plan file `{plan_path}`: {e}"
+                f"ERROR: Could not read plan file `{read_path}`: {e}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
