@@ -561,7 +561,15 @@ Output format:
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
         plan_path, storage_mode, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
-        plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
+        plan_prompt = f"""CRITICAL: You are writing a TDD TASK PLAN, not an implementation.
+Do NOT write complete working implementations in the plan.
+Do NOT write fully functional classes or modules.
+DO write: task descriptions, failing test stubs showing the
+interface, acceptance criteria, and file/function names.
+Code examples in the plan should be minimal stubs only —
+enough to define the contract, not implement it.
+
+You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
 IMPORTANT: You are building EXACTLY what the spec describes — nothing more, nothing less.
 Read the spec carefully before writing anything. Every task must directly implement a spec requirement.
@@ -730,6 +738,7 @@ Check for:
 - Spec Alignment: plan covers spec requirements, no major scope creep
 - Task Decomposition: tasks have clear boundaries, steps are actionable
 - Buildability: could an engineer follow this without getting stuck?
+- Stub discipline: code blocks must be minimal stubs (interface/contract only) — BLOCK if any code block contains a full working implementation, complete class bodies, or functional logic
 
 Only flag issues that would cause real problems during implementation.
 Approve unless there are serious gaps.
