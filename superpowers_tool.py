@@ -61,30 +61,42 @@ class Tools:
         STORAGE_BASE_PATH: str = Field(
             default="/app/backend/data/user_files",
             description=(
-                "Base path for persistent file storage. "
-                "Defaults to Open WebUI's internal user files directory. "
-                "If Fileshed is installed, set this to match Fileshed's "
-                "storage_base_path valve (default: /app/backend/data/user_files). "
-                "Files will be written to {STORAGE_BASE_PATH}/superpowers/ "
-                "Override for non-Docker installs or custom storage locations."
+                "Base path for persistent storage. When using Fileshed, set this to "
+                "match Fileshed's storage_base_path valve (default: "
+                "/app/backend/data/user_files). Files will be written to "
+                "{STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/ "
+                "which appears as superpowers/ in Fileshed's Storage zone."
             ),
         )
 
     def __init__(self):
         self.valves = self.Valves()
 
-    def _resolve_path(self, subdir: str, filename: str) -> str:
+    def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> str:
         """
         Resolves a full file path under the persistent storage base.
         Creates the directory if it does not exist.
-        Compatible with Fileshed's storage layout at
-        {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
+        If user_id is provided, uses Fileshed-compatible layout:
+          {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/{subdir}/{filename}
+        Otherwise falls back to:
+          {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
         """
-        base = os.path.join(
-            self.valves.STORAGE_BASE_PATH,
-            "superpowers",
-            subdir,
-        )
+        if user_id:
+            base = os.path.join(
+                self.valves.STORAGE_BASE_PATH,
+                "users",
+                user_id,
+                "Storage",
+                "data",
+                "superpowers",
+                subdir,
+            )
+        else:
+            base = os.path.join(
+                self.valves.STORAGE_BASE_PATH,
+                "superpowers",
+                subdir,
+            )
         os.makedirs(base, exist_ok=True)
         return os.path.join(base, filename)
 
@@ -227,7 +239,8 @@ Ask your first clarifying question now. One question only."""
         today = date.today().isoformat()
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
-        spec_path = self._resolve_path(self.valves.SPEC_DIR, filename)
+        user_id = (__user__ or {}).get("id", "")
+        spec_path = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
 
         spec_prompt = f"""You are writing a structured software spec document.
 
@@ -406,7 +419,8 @@ Output format:
         today = date.today().isoformat()
         slug = feature_name.lower().replace(" ", "-")
         filename = f"{today}-{slug}.md"
-        plan_path = self._resolve_path(self.valves.PLAN_DIR, filename)
+        user_id = (__user__ or {}).get("id", "")
+        plan_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
         plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
