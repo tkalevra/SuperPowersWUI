@@ -15,6 +15,20 @@ This port adapts them for the Open WebUI ecosystem.
 
 ---
 
+## Credits & Acknowledgements
+
+**[Superpowers](https://github.com/obra/superpowers)** by Jesse Vincent (obra) — MIT License
+The methodology, skill content, and workflow design this tool is based on.
+If this tool has been useful to you, consider [sponsoring obra](https://github.com/sponsors/obra).
+
+**[Fileshed](https://github.com/Fade78/Fileshed)** by Fade78 — MIT License
+Recommended companion tool providing persistent file storage for Open WebUI.
+The default storage path in this tool is compatible with Fileshed's workspace
+layout. Install Fileshed alongside this tool for the best experience — specs
+and plans will appear in your Fileshed Storage workspace automatically.
+
+---
+
 ## Installation
 
 1. In Open WebUI, go to **Settings → Tools → Add Tool**
@@ -89,9 +103,9 @@ Always follow the phase markers [SUPERPOWERS:PHASE:X] to track workflow state.
 
 ## File Output
 
-Spec and plan documents are saved with datestamped filenames:
-- Specs: `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
-- Plans: `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`
+Spec and plan documents are saved with datestamped filenames under the configured `STORAGE_BASE_PATH`:
+- Specs: `{STORAGE_BASE_PATH}/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
+- Plans: `{STORAGE_BASE_PATH}/superpowers/plans/YYYY-MM-DD-<feature>.md`
 
-Directories are created automatically (`os.makedirs(exist_ok=True)`).
-Paths are relative to wherever Open WebUI is running.
+Directories are created automatically. Default base path is `/app/backend/data/user_files` (Open WebUI's internal storage).
+If [Fileshed](https://github.com/Fade78/Fileshed) is installed, set `STORAGE_BASE_PATH` to match Fileshed's `storage_base_path` valve and files will appear in your Fileshed Storage workspace automatically.

@@ -7,13 +7,19 @@ methodology without requiring Claude Code.
 
 Based on Superpowers by Jesse Vincent (obra)
 https://github.com/obra/superpowers
-MIT License — https://github.com/obra/superpowers/blob/main/LICENSE
+MIT License
+
+Persistent storage path compatible with Fileshed by Fade78
+https://github.com/Fade78/Fileshed
+MIT License
+Fileshed is not required but recommended for full file persistence.
+Install Fileshed alongside this tool for the complete experience.
 
 This port is independently developed and not officially affiliated with
-the Superpowers project. Attribution is given with respect and gratitude.
+either project. Attribution given with respect and gratitude.
 
 Author: Chris Thompson (tkalevra)
-Repository: https://github.com/tkalevra/superpowers-owui
+Repository: https://github.com/tkalevra/SuperPowersWUI
 License: MIT
 """
 
@@ -41,20 +47,46 @@ class Tools:
             description="Optional separate model for spec/plan review passes. Falls back to MODEL_NAME if empty.",
         )
         SPEC_DIR: str = Field(
-            default="docs/superpowers/specs",
-            description="Directory for spec documents (relative to project root)",
+            default="specs",
+            description="Subdirectory under STORAGE_BASE_PATH/superpowers/ for spec documents",
         )
         PLAN_DIR: str = Field(
-            default="docs/superpowers/plans",
-            description="Directory for plan documents (relative to project root)",
+            default="plans",
+            description="Subdirectory under STORAGE_BASE_PATH/superpowers/ for plan documents",
         )
         API_KEY: str = Field(
             default="lm-studio",
             description="API key for endpoint. Use 'lm-studio' for LM Studio, 'ollama' for Ollama, or your actual key for remote endpoints.",
         )
+        STORAGE_BASE_PATH: str = Field(
+            default="/app/backend/data/user_files",
+            description=(
+                "Base path for persistent file storage. "
+                "Defaults to Open WebUI's internal user files directory. "
+                "If Fileshed is installed, set this to match Fileshed's "
+                "storage_base_path valve (default: /app/backend/data/user_files). "
+                "Files will be written to {STORAGE_BASE_PATH}/superpowers/ "
+                "Override for non-Docker installs or custom storage locations."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
+
+    def _resolve_path(self, subdir: str, filename: str) -> str:
+        """
+        Resolves a full file path under the persistent storage base.
+        Creates the directory if it does not exist.
+        Compatible with Fileshed's storage layout at
+        {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
+        """
+        base = os.path.join(
+            self.valves.STORAGE_BASE_PATH,
+            "superpowers",
+            subdir,
+        )
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, filename)
 
     # -------------------------------------------------------------------------
     # Internal helper
@@ -195,8 +227,7 @@ Ask your first clarifying question now. One question only."""
         today = date.today().isoformat()
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
-        spec_dir = self.valves.SPEC_DIR
-        spec_path = os.path.join(spec_dir, filename)
+        spec_path = self._resolve_path(self.valves.SPEC_DIR, filename)
 
         spec_prompt = f"""You are writing a structured software spec document.
 
@@ -259,7 +290,6 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         # Save to disk
         try:
-            os.makedirs(spec_dir, exist_ok=True)
             with open(spec_path, "w", encoding="utf-8") as f:
                 f.write(cleaned)
         except OSError as e:
@@ -376,8 +406,7 @@ Output format:
         today = date.today().isoformat()
         slug = feature_name.lower().replace(" ", "-")
         filename = f"{today}-{slug}.md"
-        plan_dir = self.valves.PLAN_DIR
-        plan_path = os.path.join(plan_dir, filename)
+        plan_path = self._resolve_path(self.valves.PLAN_DIR, filename)
 
         plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
 
@@ -465,7 +494,6 @@ Output ONLY the markdown document. No preamble, no commentary."""
             cleaned = cleaned[:-3].rstrip()
 
         try:
-            os.makedirs(plan_dir, exist_ok=True)
             with open(plan_path, "w", encoding="utf-8") as f:
                 f.write(cleaned)
         except OSError as e:
