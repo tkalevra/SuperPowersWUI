@@ -61,11 +61,12 @@ class Tools:
         STORAGE_BASE_PATH: str = Field(
             default="/app/backend/data/user_files",
             description=(
-                "Base path for persistent storage. When using Fileshed, set this to "
-                "match Fileshed's storage_base_path valve (default: "
-                "/app/backend/data/user_files). Files will be written to "
-                "{STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/ "
-                "which appears as superpowers/ in Fileshed's Storage zone."
+                "Base path for persistent storage. Defaults to Open WebUI's internal "
+                "user files directory. With Fileshed installed (recommended), specs and "
+                "plans appear automatically in your Fileshed Storage zone under "
+                "superpowers/. Without Fileshed, files are written to "
+                "{STORAGE_BASE_PATH}/superpowers/ and require filesystem access to "
+                "retrieve. Override for non-Docker installs or custom paths."
             ),
         )
 
@@ -78,24 +79,21 @@ class Tools:
         Creates the directory if it does not exist.
         If user_id is provided, uses Fileshed-compatible layout:
           {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/{subdir}/{filename}
-        Otherwise falls back to:
+        Otherwise falls back to flat path (no user scoping, works without Fileshed):
           {STORAGE_BASE_PATH}/superpowers/{subdir}/{filename}
         """
         if user_id:
+            # Fileshed-compatible path: appears in Fileshed Storage zone
             base = os.path.join(
                 self.valves.STORAGE_BASE_PATH,
-                "users",
-                user_id,
-                "Storage",
-                "data",
-                "superpowers",
-                subdir,
+                "users", user_id, "Storage", "data", "superpowers", subdir
             )
         else:
+            # Fallback: flat path under storage base, no user scoping
+            # Works without Fileshed or when user context unavailable
             base = os.path.join(
                 self.valves.STORAGE_BASE_PATH,
-                "superpowers",
-                subdir,
+                "superpowers", subdir
             )
         os.makedirs(base, exist_ok=True)
         return os.path.join(base, filename)
@@ -239,7 +237,7 @@ Ask your first clarifying question now. One question only."""
         today = date.today().isoformat()
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
-        user_id = (__user__ or {}).get("id", "")
+        user_id = (__user__ or {}).get("id", "") if __user__ else ""
         spec_path = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
 
         spec_prompt = f"""You are writing a structured software spec document.
@@ -314,7 +312,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         output = (
             f"[SUPERPOWERS:PHASE:SPEC_REVIEW]\n\n"
-            f"**Spec saved:** `{spec_path}`\n\n"
+            f"**Spec saved:** `{spec_path}`\n"
+            f"**Storage mode:** {'Fileshed-compatible (user-scoped)' if user_id else 'Fallback (flat path)'}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
 
@@ -419,7 +418,7 @@ Output format:
         today = date.today().isoformat()
         slug = feature_name.lower().replace(" ", "-")
         filename = f"{today}-{slug}.md"
-        user_id = (__user__ or {}).get("id", "")
+        user_id = (__user__ or {}).get("id", "") if __user__ else ""
         plan_path = self._resolve_path(self.valves.PLAN_DIR, filename, user_id)
 
         plan_prompt = f"""You are writing a detailed TDD implementation plan for the feature described in the spec below.
@@ -519,7 +518,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         output = (
             f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
-            f"**Plan saved:** `{plan_path}`\n\n"
+            f"**Plan saved:** `{plan_path}`\n"
+            f"**Storage mode:** {'Fileshed-compatible (user-scoped)' if user_id else 'Fallback (flat path)'}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
 
