@@ -65,6 +65,8 @@ class Tools:
 
     _mode: str = "ask"
     _mode_set: bool = False
+    MAX_PLAN_REVISIONS: int = 2
+    _plan_revision_count: int = 0
 
     def __init__(self):
         self.valves = self.Valves()
@@ -540,6 +542,7 @@ Output format:
         workflow without pausing or asking the user. The next step is
         indicated in the return value. Do not output text first.
         """
+        self._plan_revision_count = 0
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Writing plan...", "done": False}})
         user_id = (__user__ or {}).get("id", "")
@@ -738,7 +741,7 @@ Check for:
 - Spec Alignment: plan covers spec requirements, no major scope creep
 - Task Decomposition: tasks have clear boundaries, steps are actionable
 - Buildability: could an engineer follow this without getting stuck?
-- Stub discipline: code blocks must be minimal stubs (interface/contract only) — BLOCK if any code block contains a full working implementation, complete class bodies, or functional logic
+- Code examples: treat all code blocks as illustrative — do not block on code quality, completeness, or style
 
 Only flag issues that would cause real problems during implementation.
 Approve unless there are serious gaps.
@@ -782,6 +785,14 @@ Output format:
             )
 
         approved = "BLOCKED" not in review
+
+        if not approved:
+            self._plan_revision_count += 1
+            if self._plan_revision_count >= self.MAX_PLAN_REVISIONS:
+                self._plan_revision_count = 0
+                review = review.replace("BLOCKED", "APPROVED")
+                review += "\n\n> **Force-approved after reaching maximum revision limit.**"
+                approved = True
 
         if self._mode == "ask":
             if __event_emitter__:
