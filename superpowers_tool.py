@@ -26,27 +26,12 @@ License: MIT
 import os
 import json
 import typing
-import requests
 from datetime import date
 from pydantic import BaseModel, Field
 
 
 class Tools:
     class Valves(BaseModel):
-        # Required
-        LLM_BASE_URL: str = Field(
-            default="http://localhost:1234/v1",
-            description="OpenAI-compatible endpoint. LM Studio default: http://localhost:1234/v1 | Ollama: http://localhost:11434/v1",
-        )
-        MODEL_NAME: str = Field(
-            default="",
-            description="Model name to use. Leave empty to use whatever the endpoint returns as default.",
-        )
-        # Optional
-        REVIEWER_MODEL: str = Field(
-            default="",
-            description="Optional separate model for spec/plan review passes. Falls back to MODEL_NAME if empty.",
-        )
         SPEC_DIR: str = Field(
             default="specs",
             description="Subdirectory under STORAGE_BASE_PATH/superpowers/ for spec documents",
@@ -54,10 +39,6 @@ class Tools:
         PLAN_DIR: str = Field(
             default="plans",
             description="Subdirectory under STORAGE_BASE_PATH/superpowers/ for plan documents",
-        )
-        API_KEY: str = Field(
-            default="lm-studio",
-            description="API key for endpoint. Use 'lm-studio' for LM Studio, 'ollama' for Ollama, or your actual key for remote endpoints.",
         )
         STORAGE_BASE_PATH: str = Field(
             default="/app/backend/data/user_files",
@@ -82,7 +63,8 @@ class Tools:
             ),
         )
 
-    MAX_CONTINUATIONS = 3
+    _mode: str = "ask"
+    _mode_set: bool = False
 
     def __init__(self):
         self.valves = self.Valves()
@@ -105,94 +87,64 @@ class Tools:
         return path, storage_mode
 
     # -------------------------------------------------------------------------
-    # Internal helper
+    # Sub-agent helper
     # -------------------------------------------------------------------------
 
-    def _call_endpoint(
+    async def _run_sub_agent(
         self,
         system_prompt: str,
-        user_content: str,
-        use_reviewer_model: bool = False,
-        max_tokens: int = 2000,
+        user_prompt: str,
+        description: str,
+        __request__,
+        __user__: dict,
+        __metadata__: dict,
+        __model__: dict,
+        __event_emitter__,
+        __event_call__,
+        __chat_id__: str,
+        __message_id__: str,
     ) -> str:
-        """
-        Makes a direct HTTP call to the configured OpenAI-compatible endpoint.
-        Used for reviewer subagent simulation (isolated context, no conversation history).
-        """
-        url = f"{self.valves.LLM_BASE_URL}/chat/completions"
-        model = (
-            self.valves.REVIEWER_MODEL
-            if (use_reviewer_model and self.valves.REVIEWER_MODEL)
-            else self.valves.MODEL_NAME
-        )
+        from open_webui.utils.chat import generate_chat_completion
+        from open_webui.models.users import UserModel
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": user_prompt},
         ]
+        model_id = ((__metadata__ or {}).get("model") or {}).get("id", "") or (__model__ or {}).get("id", "")
 
-        headers = {
-            "Authorization": f"Bearer {self.valves.API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        accumulated = ""
-        continuations = 0
-
-        while True:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": max_tokens,
-            }
-
-            try:
-                response = requests.post(
-                    url, json=payload, headers=headers, timeout=120
-                )
-                response.raise_for_status()
-                response_data = response.json()
-                choice = response_data["choices"][0]
-                partial = choice["message"]["content"]
-                finish_reason = choice.get("finish_reason", "stop")
-            except requests.exceptions.ConnectionError:
-                return (
-                    f"ERROR: Could not connect to endpoint at {self.valves.LLM_BASE_URL}. "
-                    "Verify your LLM server is running and LLM_BASE_URL is correct."
-                )
-            except requests.exceptions.Timeout:
-                return (
-                    "ERROR: Request timed out after 120s. The model may be slow to respond. "
-                    "Try again or use a faster model."
-                )
-            except KeyError:
-                return (
-                    "ERROR: Unexpected response format from endpoint. "
-                    "Ensure your endpoint returns OpenAI-compatible JSON with choices[0].message.content."
-                )
-            except requests.exceptions.HTTPError as e:
-                return f"ERROR: HTTP {response.status_code} from endpoint: {e}"
-
-            accumulated += partial
-
-            if finish_reason != "length" or continuations >= self.MAX_CONTINUATIONS:
-                break
-
-            continuations += 1
-            messages.append({"role": "assistant", "content": partial})
-            messages.append({"role": "user", "content": "Continue exactly where you left off. Do not repeat anything."})
-
-        if continuations >= self.MAX_CONTINUATIONS and finish_reason == "length":
-            accumulated += "\n\n[SUPERPOWERS:WARNING] Output may be incomplete — max continuation attempts reached."
-
-        return accumulated
+        try:
+            response = await generate_chat_completion(
+                request=__request__,
+                form_data={
+                    "model": model_id,
+                    "messages": messages,
+                    "stream": False,
+                    "metadata": {"task": "superpowers_sub_agent"},
+                },
+                user=UserModel(**__user__),
+                bypass_filter=True,
+            )
+            return response["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"[SUPERPOWERS:ERROR] {e}"
 
     # -------------------------------------------------------------------------
     # Tool functions
     # -------------------------------------------------------------------------
 
-    async def brainstorm(self, idea: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def brainstorm(
+        self,
+        idea: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
         Initiates the Superpowers brainstorming phase for a new feature or project idea.
         Enforces the HARD-GATE: no code until a spec is approved.
@@ -205,46 +157,64 @@ class Tools:
         workflow without pausing or asking the user. The next step is
         indicated in the return value. Do not output text first.
         """
+        # Mode detection
+        idea_lower = idea.lower()
+        if "cook" in idea_lower:
+            self._mode = "cook"
+            self._mode_set = True
+        elif "ask" in idea_lower:
+            self._mode = "ask"
+            self._mode_set = True
+        elif not self._mode_set:
+            self._mode_set = True
+            msg = (
+                "Ready to build. Two modes:\n\n**Cook** — I run autonomously to "
+                "completion. No interruptions unless something breaks.\n\n**Ask** — "
+                "I pause at each phase for your approval before continuing.\n\nSay "
+                "**cook** to go hands-off, or **ask** if you want control. "
+                "You can switch anytime by saying either word."
+            )
+            if __event_emitter__:
+                await __event_emitter__({"type": "message", "data": {"content": msg}})
+            return msg
+
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Brainstorming...", "done": False}})
-        brainstorm_prompt = f"""You are now in SUPERPOWERS BRAINSTORMING MODE.
 
-## Rules (enforce strictly)
-- Ask ONE clarifying question at a time. Wait for answers before proceeding.
-- Propose 2-3 concrete approaches with explicit tradeoffs when you have enough context.
-- Present design decisions in sections; get user approval after each section.
-- HARD-GATE: Do NOT write any implementation code until the user explicitly approves a spec.
-- YAGNI ruthlessly: cut every feature not directly requested.
-- When the design is complete and approved, instruct the user to say "write the spec" to proceed.
-
-## Starting idea
-{idea}
-
-Ask your first clarifying question now. One question only."""
-
-        output = (
-            f"[SUPERPOWERS:PHASE:BRAINSTORMING]\n\n"
-            f"**Superpowers brainstorming started.**\n"
-            f"Topic: _{idea}_\n\n"
-            f"**Brainstorm context injected.** The model will now ask clarifying questions "
-            f"one at a time. Answer them to converge on a design.\n\n"
-            f"**HARD-GATE active:** No implementation code will be written until you approve a spec.\n\n"
-            f"When the design feels right, say **\"write the spec\"** to save and review it.\n\n"
-            f"---\n\n"
+        result = await self._run_sub_agent(
+            system_prompt=(
+                "You are a senior software architect. Ask ONE clarifying question to refine "
+                "the user's idea before spec writing. Do not answer your own question. "
+                "Do not write a spec yet."
+            ),
+            user_prompt=idea,
+            description="Brainstorming",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
         )
 
-        # Kick off the first question via a direct completion call
-        first_question = self._call_endpoint(
-            system_prompt=brainstorm_prompt,
-            user_content=f"Begin brainstorming the following idea: {idea}",
-        )
-
-        output += first_question
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return output + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+        return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
-    async def start_spec(self, topic_and_summary: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def start_spec(
+        self,
+        topic_and_summary: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
         Write a spec from a single combined string. Use this instead of write_spec
         when the model has trouble with multi-argument tool calls.
@@ -266,12 +236,29 @@ Ask your first clarifying question now. One question only."""
         summary = parts[1].strip() if len(parts) > 1 else topic
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return await self.write_spec(topic, summary, __user__, __metadata__, __event_emitter__)
+        return await self.write_spec(
+            topic, summary,
+            __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
+            __request__=__request__, __model__=__model__, __event_call__=__event_call__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__,
+        )
 
-    async def write_spec(self, topic: str, design_summary: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def write_spec(
+        self,
+        topic: str,
+        design_summary: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
         Saves the approved brainstorm design as a structured spec document, then
-        automatically runs a subagent reviewer pass against it.
+        automatically runs a subagent reviewer pass against it in cook mode.
         Trigger phrases: 'write the spec', 'save the spec', 'design approved'.
 
         Args:
@@ -328,13 +315,21 @@ _Generated by superpowers-owui | Based on [Superpowers](https://github.com/obra/
 
 Output ONLY the markdown document. No preamble, no commentary."""
 
-        spec_content = self._call_endpoint(
+        spec_content = await self._run_sub_agent(
             system_prompt=spec_prompt,
-            user_content=f"Write the spec for: {topic}",
-            max_tokens=4000,
+            user_prompt=f"Write the spec for: {topic}",
+            description="Writing spec",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
         )
 
-        if spec_content.startswith("ERROR:"):
+        if spec_content.startswith("[SUPERPOWERS:ERROR]"):
             return (
                 f"[SUPERPOWERS:PHASE:SPEC_ERROR]\n\n"
                 f"Failed to generate spec document.\n\n{spec_content}"
@@ -361,23 +356,50 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
+        storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
+
+        if self._mode == "ask":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            return (
+                f"[SUPERPOWERS:PHASE:SPEC_REVIEW]\n\n"
+                f"**Spec saved:** `{spec_path}`\n"
+                f"**Storage:** {storage_label}\n\n"
+                f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Spec written. Reply **cook** to continue to review, or give feedback to revise."
+            )
+
+        # cook mode: auto-review
         output = (
             f"[SUPERPOWERS:PHASE:SPEC_REVIEW]\n\n"
             f"**Spec saved:** `{spec_path}`\n"
-            f"**Storage:** {'Fileshed Storage zone (superpowers/)' if storage_mode == 'fileshed' else 'Standalone path'}\n\n"
+            f"**Storage:** {storage_label}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
-
-        review_result = await self.review_spec(spec_path, __event_emitter__=__event_emitter__)
+        review_result = await self.review_spec(
+            spec_path,
+            __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
+            __request__=__request__, __model__=__model__, __event_call__=__event_call__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__,
+        )
         output += review_result
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output
 
-    async def review_spec(self, spec_path: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def review_spec(
+        self,
+        spec_path: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
-        Runs an isolated subagent reviewer pass against a saved spec document.
-        Makes a direct HTTP call with no conversation history — pure document review.
+        Runs a sub-agent reviewer pass against a saved spec document.
 
         Args:
             spec_path: Path to the spec markdown file to review.
@@ -388,6 +410,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         """
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Reviewing spec...", "done": False}})
+
         reviewer_system_prompt = """You are a spec document reviewer. Your job is to APPROVE specs, not perfect them.
 
 A spec is ready when a competent developer could implement it without building the wrong thing.
@@ -422,21 +445,49 @@ Output format:
         except OSError as e:
             return f"ERROR: Could not read spec file `{spec_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
-        review = self._call_endpoint(
+        review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
-            user_content=spec_content,
-            use_reviewer_model=True,
+            user_prompt=spec_content,
+            description="Reviewing spec",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
         )
 
-        if review.startswith("ERROR:"):
+        if review.startswith("[SUPERPOWERS:ERROR]"):
             return (
-                f"**Reviewer subagent failed:**\n\n{review}\n\n"
+                f"**Reviewer sub-agent failed:**\n\n{review}\n\n"
                 f"Review the spec manually at `{spec_path}`, then say **\"write the plan\"** to proceed."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
         approved = "BLOCKED" not in review
 
+        if self._mode == "ask":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            if approved:
+                return (
+                    f"{review}\n\n"
+                    f"---\n\n"
+                    f"**Spec is approved.** Review the full document at:\n"
+                    f"`{spec_path}`\n\n"
+                    f"[SUPERPOWERS:PHASE:COMPLETE] Spec approved. Reply **cook** to continue to plan, or give feedback to revise."
+                )
+            else:
+                return (
+                    f"{review}\n\n"
+                    f"---\n\n"
+                    f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
+                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call review_spec again."
+                )
+
+        # cook mode
         if approved:
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
@@ -458,10 +509,22 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    async def write_plan(self, spec_path: str, feature_name: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def write_plan(
+        self,
+        spec_path: str,
+        feature_name: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
         Reads an approved spec and generates a detailed TDD implementation plan,
-        then automatically runs a subagent reviewer pass against it.
+        then automatically runs a subagent reviewer pass against it in cook mode.
         Trigger phrases: 'write the plan', 'create implementation plan', 'spec approved'.
 
         Args:
@@ -548,18 +611,26 @@ git commit -m "feat: [what this task implements]"
 
 Output ONLY the markdown document. No preamble, no commentary."""
 
-        plan_content = self._call_endpoint(
+        plan_content = await self._run_sub_agent(
             system_prompt=plan_prompt,
-            user_content=(
+            user_prompt=(
                 f"Feature: {feature_name}\n\n"
                 f"Spec content:\n\n{spec_content}\n\n"
                 f"Write the complete implementation plan now. Cover every requirement in the spec. "
                 f"Do not stop until all tasks are written."
             ),
-            max_tokens=4000,
+            description="Writing plan",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
         )
 
-        if plan_content.startswith("ERROR:"):
+        if plan_content.startswith("[SUPERPOWERS:ERROR]"):
             return (
                 f"[SUPERPOWERS:PHASE:PLAN_ERROR]\n\n"
                 f"Failed to generate plan document.\n\n{plan_content}"
@@ -585,23 +656,50 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
+        storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
+
+        if self._mode == "ask":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            return (
+                f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
+                f"**Plan saved:** `{plan_path}`\n"
+                f"**Storage:** {storage_label}\n\n"
+                f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Plan written. Reply **cook** to continue to review, or give feedback to revise."
+            )
+
+        # cook mode: auto-review
         output = (
             f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
             f"**Plan saved:** `{plan_path}`\n"
-            f"**Storage:** {'Fileshed Storage zone (superpowers/)' if storage_mode == 'fileshed' else 'Standalone path'}\n\n"
+            f"**Storage:** {storage_label}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
-
-        review_result = await self.review_plan(plan_path, __event_emitter__=__event_emitter__)
+        review_result = await self.review_plan(
+            plan_path,
+            __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
+            __request__=__request__, __model__=__model__, __event_call__=__event_call__,
+            __chat_id__=__chat_id__, __message_id__=__message_id__,
+        )
         output += review_result
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output
 
-    async def review_plan(self, plan_path: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def review_plan(
+        self,
+        plan_path: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
-        Runs an isolated subagent reviewer pass against a saved implementation plan.
-        Makes a direct HTTP call with no conversation history — pure document review.
+        Runs a sub-agent reviewer pass against a saved implementation plan.
 
         Args:
             plan_path: Path to the plan markdown file to review.
@@ -612,6 +710,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         """
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Reviewing plan...", "done": False}})
+
         reviewer_system_prompt = """You are a plan document reviewer. Verify this plan is complete and ready for implementation.
 
 Check for:
@@ -637,21 +736,52 @@ Output format:
         except OSError as e:
             return f"ERROR: Could not read plan file `{plan_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
-        review = self._call_endpoint(
+        review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
-            user_content=plan_content,
-            use_reviewer_model=True,
+            user_prompt=plan_content,
+            description="Reviewing plan",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
         )
 
-        if review.startswith("ERROR:"):
+        if review.startswith("[SUPERPOWERS:ERROR]"):
             return (
-                f"**Reviewer subagent failed:**\n\n{review}\n\n"
+                f"**Reviewer sub-agent failed:**\n\n{review}\n\n"
                 f"Review the plan manually at `{plan_path}`, then say **\"execute task 1\"** to begin."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
         approved = "BLOCKED" not in review
 
+        if self._mode == "ask":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            if approved:
+                return (
+                    f"[SUPERPOWERS:PHASE:READY]\n\n"
+                    f"{review}\n\n"
+                    f"---\n\n"
+                    f"**Plan is approved and ready for execution.**\n\n"
+                    f"Plan file: `{plan_path}`\n\n"
+                    f"[SUPERPOWERS:PHASE:COMPLETE] Plan approved. Reply **cook** to begin execution, or give feedback to revise."
+                )
+            else:
+                return (
+                    f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
+                    f"{review}\n\n"
+                    f"---\n\n"
+                    f"**Issues found in plan.** Edit `{plan_path}` to address the issues above, "
+                    f"then call `review_plan` again with the same path."
+                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call review_plan again."
+                )
+
+        # cook mode
         if approved:
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
@@ -677,9 +807,21 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    async def execute_task(self, plan_path: str, task_number: int, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
+    async def execute_task(
+        self,
+        plan_path: str,
+        task_number: int,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
         """
-        Loads a specific task from an approved plan and injects TDD execution context.
+        Loads a specific task from an approved plan and executes it via TDD sub-agent.
         Does NOT auto-advance — you control the pace, one task at a time.
         Trigger phrases: 'execute task 1', 'run task', 'start execution'.
 
@@ -705,8 +847,6 @@ Output format:
 
         # Extract the requested task block
         task_header = f"### Task {task_number}:"
-        task_block = ""
-
         lines = plan_content.splitlines()
         in_task = False
         task_lines = []
@@ -717,14 +857,11 @@ Output format:
                 task_lines.append(line)
                 continue
             if in_task:
-                # Stop at next task header or end of document
                 if line.strip().startswith("### Task ") and not line.strip().startswith(task_header):
                     break
                 task_lines.append(line)
 
-        if task_lines:
-            task_block = "\n".join(task_lines).strip()
-        else:
+        if not task_lines:
             return (
                 f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
                 f"ERROR: Task {task_number} not found in plan `{plan_path}`.\n\n"
@@ -732,34 +869,55 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        tdd_context = f"""[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]
+        task_block = "\n".join(task_lines).strip()
 
-## TDD Execution — Task {task_number}
+        tdd_system_prompt = (
+            f"You are executing TDD implementation task {task_number} from a plan.\n\n"
+            "Strict TDD rules:\n"
+            "1. Write the failing test FIRST — no implementation code yet\n"
+            "2. Run the test and confirm it FAILS (this proves the test is real)\n"
+            "3. Write the MINIMAL implementation to make the test pass\n"
+            "4. Run the test again and confirm it PASSES\n"
+            "5. Commit with the exact git commands specified in the task\n\n"
+            "Do not skip steps. Do not write implementation before the test exists.\n"
+            "Do not auto-advance to the next task when done — report completion and wait.\n\n"
+            f"Plan file: {plan_path}"
+        )
 
-**Plan file:** `{plan_path}`
+        result = await self._run_sub_agent(
+            system_prompt=tdd_system_prompt,
+            user_prompt=f"Execute this task:\n\n{task_block}",
+            description=f"Executing task {task_number}",
+            __request__=__request__,
+            __user__=__user__,
+            __metadata__=__metadata__,
+            __model__=__model__,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __chat_id__=__chat_id__,
+            __message_id__=__message_id__,
+        )
 
-**Strict TDD rules for this task:**
-1. Write the failing test FIRST — no implementation code yet
-2. Run the test and confirm it FAILS (this proves the test is real)
-3. Write the MINIMAL implementation to make the test pass
-4. Run the test again and confirm it PASSES
-5. Commit with the exact git commands specified in the task
-
-**Do not skip steps. Do not write implementation before the test exists.**
-**Do not auto-advance to the next task when done — report completion and wait.**
-
----
-
-## Task {task_number} Content
-
-{task_block}
-
----
-
-Begin with Step 1: write the failing test. Show the complete test code.
-
-**Tip:** If Fileshed is installed, verify the plan file with:
-`shed_exec(zone="storage", path="superpowers/plans/{os.path.basename(plan_path)}", cmd="cat")`"""
+        tdd_context = (
+            f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
+            f"## TDD Execution — Task {task_number}\n\n"
+            f"**Plan file:** `{plan_path}`\n\n"
+            f"**Strict TDD rules for this task:**\n"
+            f"1. Write the failing test FIRST — no implementation code yet\n"
+            f"2. Run the test and confirm it FAILS (this proves the test is real)\n"
+            f"3. Write the MINIMAL implementation to make the test pass\n"
+            f"4. Run the test again and confirm it PASSES\n"
+            f"5. Commit with the exact git commands specified in the task\n\n"
+            f"**Do not skip steps. Do not write implementation before the test exists.**\n"
+            f"**Do not auto-advance to the next task when done — report completion and wait.**\n\n"
+            f"---\n\n"
+            f"## Task {task_number} Content\n\n"
+            f"{task_block}\n\n"
+            f"---\n\n"
+            f"{result}\n\n"
+            f"**Tip:** If Fileshed is installed, verify the plan file with:\n"
+            f"`shed_exec(zone=\"storage\", path=\"superpowers/plans/{os.path.basename(plan_path)}\", cmd=\"cat\")`"
+        )
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
