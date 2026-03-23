@@ -82,6 +82,8 @@ class Tools:
             ),
         )
 
+    MAX_CONTINUATIONS = 3
+
     def __init__(self):
         self.valves = self.Valves()
 
@@ -124,44 +126,67 @@ class Tools:
             else self.valves.MODEL_NAME
         )
 
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.3,
-            "max_tokens": max_tokens,
-        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
 
         headers = {
             "Authorization": f"Bearer {self.valves.API_KEY}",
             "Content-Type": "application/json",
         }
 
-        try:
-            response = requests.post(
-                url, json=payload, headers=headers, timeout=120
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-        except requests.exceptions.ConnectionError:
-            return (
-                f"ERROR: Could not connect to endpoint at {self.valves.LLM_BASE_URL}. "
-                "Verify your LLM server is running and LLM_BASE_URL is correct."
-            )
-        except requests.exceptions.Timeout:
-            return (
-                "ERROR: Request timed out after 120s. The model may be slow to respond. "
-                "Try again or use a faster model."
-            )
-        except KeyError:
-            return (
-                "ERROR: Unexpected response format from endpoint. "
-                "Ensure your endpoint returns OpenAI-compatible JSON with choices[0].message.content."
-            )
-        except requests.exceptions.HTTPError as e:
-            return f"ERROR: HTTP {response.status_code} from endpoint: {e}"
+        accumulated = ""
+        continuations = 0
+
+        while True:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": max_tokens,
+            }
+
+            try:
+                response = requests.post(
+                    url, json=payload, headers=headers, timeout=120
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                choice = response_data["choices"][0]
+                partial = choice["message"]["content"]
+                finish_reason = choice.get("finish_reason", "stop")
+            except requests.exceptions.ConnectionError:
+                return (
+                    f"ERROR: Could not connect to endpoint at {self.valves.LLM_BASE_URL}. "
+                    "Verify your LLM server is running and LLM_BASE_URL is correct."
+                )
+            except requests.exceptions.Timeout:
+                return (
+                    "ERROR: Request timed out after 120s. The model may be slow to respond. "
+                    "Try again or use a faster model."
+                )
+            except KeyError:
+                return (
+                    "ERROR: Unexpected response format from endpoint. "
+                    "Ensure your endpoint returns OpenAI-compatible JSON with choices[0].message.content."
+                )
+            except requests.exceptions.HTTPError as e:
+                return f"ERROR: HTTP {response.status_code} from endpoint: {e}"
+
+            accumulated += partial
+
+            if finish_reason != "length" or continuations >= self.MAX_CONTINUATIONS:
+                break
+
+            continuations += 1
+            messages.append({"role": "assistant", "content": partial})
+            messages.append({"role": "user", "content": "Continue exactly where you left off. Do not repeat anything."})
+
+        if continuations >= self.MAX_CONTINUATIONS and finish_reason == "length":
+            accumulated += "\n\n[SUPERPOWERS:WARNING] Output may be incomplete — max continuation attempts reached."
+
+        return accumulated
 
     # -------------------------------------------------------------------------
     # Tool functions
