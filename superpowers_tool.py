@@ -910,6 +910,77 @@ Output format:
                 f"\n[SUPERPOWERS:MODE:COOK]"
             )
 
+    def _validate_code(self, content: str) -> list:
+        """
+        Extract Python code blocks from content and validate each one.
+        Returns a list of issue strings. Empty list means all clean.
+
+        Runs two passes:
+        1. ast.parse — catches all syntax errors (always available)
+        2. pyflakes  — catches undefined names, missing imports,
+                       scope issues, duplicate definitions
+                       (gracefully skipped if not installed)
+        """
+        import ast
+        import re
+
+        issues = []
+
+        # Extract all ```python ... ``` blocks from the content
+        code_blocks = re.findall(
+            r"```python\s*\n(.*?)```",
+            content,
+            re.DOTALL
+        )
+
+        if not code_blocks:
+            return issues
+
+        for i, code in enumerate(code_blocks, start=1):
+            label = f"Block {i}"
+
+            # Pass 1: syntax check via ast.parse
+            try:
+                ast.parse(code)
+            except SyntaxError as e:
+                issues.append(
+                    f"{label} syntax error at line {e.lineno}: {e.msg}"
+                )
+                continue  # No point running pyflakes on broken syntax
+
+            # Pass 2: static analysis via pyflakes (optional)
+            try:
+                from pyflakes import api as pyflakes_api
+
+                class _StringReporter:
+                    def __init__(self):
+                        self.messages = []
+                    def unexpectedError(self, filename, msg):
+                        self.messages.append(f"unexpected error: {msg}")
+                    def syntaxError(self, filename, msg, lineno, offset, text):
+                        self.messages.append(f"syntax error line {lineno}: {msg}")
+                    def flake(self, message):
+                        self.messages.append(str(message))
+
+                reporter = _StringReporter()
+                pyflakes_api.check(code, filename=f"<block{i}>",
+                                   reporter=reporter)
+
+                for msg in reporter.messages:
+                    if any(k in msg for k in [
+                        "undefined name",
+                        "redefinition of unused",
+                        "imported but unused",
+                        "local variable",
+                        "referenced before assignment",
+                    ]):
+                        issues.append(f"{label}: {msg}")
+
+            except ImportError:
+                pass  # pyflakes not installed — skip silently
+
+        return issues
+
     async def execute_task(
         self,
         plan_path: str,
@@ -1033,7 +1104,22 @@ Output format:
             __message_id__=__message_id__,
         )
 
-        if "[SUPERPOWERS:PHASE1:DONE]" in result:
+        # Validate Phase 1 output before proceeding to Phase 2
+        phase1_issues = self._validate_code(result)
+        if phase1_issues:
+            issue_list = "\n".join(f"  - {iss}" for iss in phase1_issues)
+            result += (
+                f"\n\n---\n\n"
+                f"[SUPERPOWERS:VALIDATION:FAILED]\n\n"
+                f"**Static analysis found {len(phase1_issues)} issue(s) "
+                f"in generated code blocks. These must be fixed before "
+                f"running tests:**\n\n"
+                f"{issue_list}\n\n"
+                f"Fix the issues above, then re-run this task before "
+                f"proceeding to the next one."
+            )
+            combined_result = result
+        elif "[SUPERPOWERS:PHASE1:DONE]" in result:
             phase2_system_prompt = (
                 "You are in PHASE 2: IMPLEMENTATION.\n\n"
                 "The test file from Phase 1 defines the contract. Write the\n"
@@ -1094,6 +1180,26 @@ Output format:
             f"**Tip:** If Fileshed is installed, verify the plan file with:\n"
             f"`shed_exec(zone=\"storage\", path=\"superpowers/plans/{os.path.basename(plan_path)}\", cmd=\"cat\")`"
         )
+
+        # Validate all code blocks in the combined output
+        validation_issues = self._validate_code(tdd_context)
+        if validation_issues:
+            issue_list = "\n".join(f"  - {iss}" for iss in validation_issues)
+            tdd_context += (
+                f"\n\n---\n\n"
+                f"[SUPERPOWERS:VALIDATION:FAILED]\n\n"
+                f"**Static analysis found {len(validation_issues)} issue(s) "
+                f"in generated code blocks. These must be fixed before "
+                f"running tests:**\n\n"
+                f"{issue_list}\n\n"
+                f"Fix the issues above, then re-run this task before "
+                f"proceeding to the next one."
+            )
+        else:
+            tdd_context += (
+                f"\n\n[SUPERPOWERS:VALIDATION:PASSED] "
+                f"Syntax and static analysis clean."
+            )
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
