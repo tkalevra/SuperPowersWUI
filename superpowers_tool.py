@@ -25,6 +25,7 @@ License: MIT
 
 import os
 import json
+import typing
 import requests
 from datetime import date
 from pydantic import BaseModel, Field
@@ -166,7 +167,7 @@ class Tools:
     # Tool functions
     # -------------------------------------------------------------------------
 
-    async def brainstorm(self, idea: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def brainstorm(self, idea: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Initiates the Superpowers brainstorming phase for a new feature or project idea.
         Enforces the HARD-GATE: no code until a spec is approved.
@@ -174,7 +175,13 @@ class Tools:
 
         Args:
             idea: The feature, project, or problem you want to brainstorm.
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Brainstorming...", "done": False}})
         brainstorm_prompt = f"""You are now in SUPERPOWERS BRAINSTORMING MODE.
 
 ## Rules (enforce strictly)
@@ -208,9 +215,11 @@ Ask your first clarifying question now. One question only."""
         )
 
         output += first_question
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
 
-    async def start_spec(self, topic_and_summary: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def start_spec(self, topic_and_summary: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Write a spec from a single combined string. Use this instead of write_spec
         when the model has trouble with multi-argument tool calls.
@@ -220,13 +229,21 @@ Ask your first clarifying question now. One question only."""
 
         Args:
             topic_and_summary: Topic slug and design summary joined by '|||'.
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Starting spec...", "done": False}})
         parts = topic_and_summary.split("|||", 1)
         topic = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else topic
-        return await self.write_spec(topic, summary, __user__, __metadata__)
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+        return await self.write_spec(topic, summary, __user__, __metadata__, __event_emitter__)
 
-    async def write_spec(self, topic: str, design_summary: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def write_spec(self, topic: str, design_summary: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Saves the approved brainstorm design as a structured spec document, then
         automatically runs a subagent reviewer pass against it.
@@ -236,7 +253,13 @@ Ask your first clarifying question now. One question only."""
             topic: Short slug for the feature (used in filename, e.g. 'user-auth').
             design_summary: Summary of the agreed design from the brainstorm conversation.
         IMPORTANT: design_summary must be a single JSON string with all internal quotes and newlines properly escaped.
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Writing spec...", "done": False}})
         today = date.today().isoformat()
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
@@ -320,18 +343,26 @@ Output ONLY the markdown document. No preamble, no commentary."""
             f"Running automated reviewer...\n\n---\n\n"
         )
 
-        review_result = await self.review_spec(spec_path)
+        review_result = await self.review_spec(spec_path, __event_emitter__=__event_emitter__)
         output += review_result
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output
 
-    async def review_spec(self, spec_path: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def review_spec(self, spec_path: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Runs an isolated subagent reviewer pass against a saved spec document.
         Makes a direct HTTP call with no conversation history — pure document review.
 
         Args:
             spec_path: Path to the spec markdown file to review.
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Reviewing spec...", "done": False}})
         reviewer_system_prompt = """You are a spec document reviewer. Your job is to APPROVE specs, not perfect them.
 
 A spec is ready when a competent developer could implement it without building the wrong thing.
@@ -382,6 +413,8 @@ Output format:
         approved = "Issues Found" not in review
 
         if approved:
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
                 f"{review}\n\n"
                 f"---\n\n"
@@ -391,6 +424,8 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
         else:
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
                 f"{review}\n\n"
                 f"---\n\n"
@@ -398,7 +433,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    async def write_plan(self, spec_path: str, feature_name: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def write_plan(self, spec_path: str, feature_name: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Reads an approved spec and generates a detailed TDD implementation plan,
         then automatically runs a subagent reviewer pass against it.
@@ -407,7 +442,13 @@ Output format:
         Args:
             spec_path: Path to the approved spec markdown file.
             feature_name: Short name for the feature (used in filename, e.g. 'user-auth').
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Writing plan...", "done": False}})
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
                 spec_content = f.read()
@@ -526,18 +567,26 @@ Output ONLY the markdown document. No preamble, no commentary."""
             f"Running automated reviewer...\n\n---\n\n"
         )
 
-        review_result = await self.review_plan(plan_path)
+        review_result = await self.review_plan(plan_path, __event_emitter__=__event_emitter__)
         output += review_result
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output
 
-    async def review_plan(self, plan_path: str, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def review_plan(self, plan_path: str, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Runs an isolated subagent reviewer pass against a saved implementation plan.
         Makes a direct HTTP call with no conversation history — pure document review.
 
         Args:
             plan_path: Path to the plan markdown file to review.
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Reviewing plan...", "done": False}})
         reviewer_system_prompt = """You are a plan document reviewer. Verify this plan is complete and ready for implementation.
 
 Check for:
@@ -579,6 +628,8 @@ Output format:
         approved = "Issues Found" not in review
 
         if approved:
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
                 f"[SUPERPOWERS:PHASE:READY]\n\n"
                 f"{review}\n\n"
@@ -590,6 +641,8 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
         else:
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
             return (
                 f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                 f"{review}\n\n"
@@ -599,7 +652,7 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-    async def execute_task(self, plan_path: str, task_number: int, __user__: dict = None, __metadata__: dict = None) -> str:
+    async def execute_task(self, plan_path: str, task_number: int, __user__: dict = None, __metadata__: dict = None, __event_emitter__: typing.Callable[[dict], typing.Any] = None) -> str:
         """
         Loads a specific task from an approved plan and injects TDD execution context.
         Does NOT auto-advance — you control the pace, one task at a time.
@@ -608,7 +661,13 @@ Output format:
         Args:
             plan_path: Path to the approved plan markdown file.
             task_number: The task number to execute (1-based).
+
+        After this tool returns, immediately call the next tool in the
+        workflow without pausing or asking the user. The next step is
+        indicated in the return value. Do not output text first.
         """
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Executing task...", "done": False}})
         try:
             with open(plan_path, "r", encoding="utf-8") as f:
                 plan_content = f.read()
@@ -677,4 +736,6 @@ Begin with Step 1: write the failing test. Show the complete test code.
 **Tip:** If Fileshed is installed, verify the plan file with:
 `shed_exec(zone="storage", path="superpowers/plans/{os.path.basename(plan_path)}", cmd="cat")`"""
 
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return tdd_context + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
