@@ -62,6 +62,16 @@ class Tools:
                 "Both tools must have matching storage_base_path valve values."
             ),
         )
+        COMPLEXITY: str = Field(
+            default="simple",
+            description=(
+                "Controls spec and plan verbosity. "
+                "simple = concise bullet-point spec and minimal plan, fast. "
+                "medium = standard spec with edge cases, full TDD plan. "
+                "complex = exhaustive spec, detailed plan, full review cycles. "
+                "Values: simple, medium, complex."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -355,9 +365,30 @@ comparison requirements are invalid and will be rejected.
 
 Output ONLY the markdown document. No preamble, no commentary."""
 
+        if self.valves.COMPLEXITY == "simple":
+            spec_system_prompt = (
+                "You are a senior software engineer. Write a concise spec "
+                "for the following design. Use short bullet points only. "
+                "Cover: purpose, inputs/outputs, key requirements, error "
+                "handling. Maximum 300 words. No prose paragraphs."
+            )
+        elif self.valves.COMPLEXITY == "complex":
+            spec_system_prompt = (
+                "You are a senior software architect. Write an exhaustive "
+                "technical spec covering: purpose, all inputs/outputs, full "
+                "requirements list, edge cases, security considerations, "
+                "error handling, success criteria, and constraints."
+            )
+        else:  # medium (default)
+            spec_system_prompt = (
+                "You are a senior software engineer. Write a clear technical "
+                "spec covering: purpose, inputs/outputs, requirements, key "
+                "edge cases, and error handling. Be thorough but concise."
+            )
+
         spec_content = await self._run_sub_agent(
-            system_prompt=spec_prompt,
-            user_prompt=f"Write the spec for: {topic}",
+            system_prompt=spec_system_prompt,
+            user_prompt=spec_prompt,
             description="Writing spec",
             __request__=__request__,
             __user__=__user__,
@@ -397,6 +428,16 @@ Output ONLY the markdown document. No preamble, no commentary."""
             )
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
+
+        if self.valves.COMPLEXITY == "simple" and self._get_mode(__messages__) == "cook":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            return (
+                f"[SUPERPOWERS:PHASE:SPEC_DONE]\n\n"
+                f"**Spec saved:** `{spec_path}`\n"
+                f"**Mode:** simple — skipping review, proceeding to plan.\n\n"
+                f"[SUPERPOWERS:AUTO-CONTINUE]"
+            )
 
         if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
@@ -699,9 +740,31 @@ Output ONLY the markdown document. No preamble, no commentary."""
         if revision_notes:
             user_prompt += f"\n\n## Revision Notes (address these before finalizing):\n{revision_notes}"
 
+        if self.valves.COMPLEXITY == "simple":
+            plan_system_prompt = (
+                "You are a senior software engineer. Write a minimal TDD "
+                "implementation plan. List tasks only. Each task: one failing "
+                "test, one implementation step, one commit. Maximum 5 tasks. "
+                "No prose. No preamble."
+            )
+        elif self.valves.COMPLEXITY == "complex":
+            plan_system_prompt = (
+                "You are a senior software engineer. Write a detailed TDD "
+                "implementation plan. Each task must include: failing test "
+                "code, full implementation steps, edge case handling, and "
+                "a commit message. Cover all requirements from the spec."
+            )
+        else:  # medium
+            plan_system_prompt = (
+                "You are a senior software engineer. Write a TDD "
+                "implementation plan. Each task: failing test, "
+                "implementation steps, commit message. Be complete "
+                "but avoid unnecessary verbosity."
+            )
+
         plan_content = await self._run_sub_agent(
-            system_prompt=plan_prompt,
-            user_prompt=user_prompt,
+            system_prompt=plan_system_prompt,
+            user_prompt=plan_prompt + "\n\n" + user_prompt,
             description="Writing plan",
             __request__=__request__,
             __user__=__user__,
@@ -740,6 +803,16 @@ Output ONLY the markdown document. No preamble, no commentary."""
             )
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
+
+        if self.valves.COMPLEXITY == "simple" and self._get_mode(__messages__) == "cook":
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            return (
+                f"[SUPERPOWERS:PHASE:PLAN_DONE]\n\n"
+                f"**Plan saved:** `{plan_path}`\n"
+                f"**Mode:** simple — skipping review, proceeding to execute task 1.\n\n"
+                f"[SUPERPOWERS:AUTO-CONTINUE]"
+            )
 
         if self._get_mode(__messages__) == "ask":
             if __event_emitter__:
@@ -1055,49 +1128,22 @@ Output format:
 
         task_block = "\n".join(task_lines).strip()
 
-        tdd_system_prompt = (
-            f"You are executing TDD task {task_number}. This is a two-phase\n"
-            "process. You are in PHASE 1: TEST WRITING ONLY.\n\n"
-            "PHASE 1 — Write the failing test:\n"
-            "1. Read the task stub carefully — it defines the interface contract\n"
-            "2. Write the complete test file for this task\n"
-            "3. The test must import from the module path specified in the task\n"
-            "4. Every assertion must be meaningful — no assert True or assert False\n"
-            "5. Output the complete test file content and nothing else\n"
-            "6. Do NOT write any implementation code in this phase\n"
-            "7. Before outputting the test file, run this mental checklist:\n\n"
-            "COMPILATION GATE (fix before outputting — no exceptions):\n"
-            "- Every name used has a corresponding import statement at the\n"
-            "  top of the file. Check: os, sys, time, pathlib, typing,\n"
-            "  dataclasses, threading, json, re, argparse — any stdlib\n"
-            "  module used must be explicitly imported.\n"
-            "- No name is used before it is defined in the file.\n"
-            "- Every class and function name is unique — no duplicates.\n"
-            "- Would `python -m py_compile file.py` succeed on this code?\n"
-            "  If any doubt: fix it first, then output.\n\n"
-            "CRITICAL: A test file that crashes on import is worse than no\n"
-            "test at all. A missing import is not a style issue — it is a\n"
-            "broken test.\n\n"
-            "8. End your response with exactly: [SUPERPOWERS:PHASE1:DONE]\n\n"
-            "After PHASE 1 is confirmed, PHASE 2 will write the implementation\n"
-            "to make those tests pass.\n\n"
-            "Before writing, check if a knowledge base is available with\n"
-            "project context or coding standards. If list_knowledge_bases or\n"
-            "query_knowledge_files tools are available, query them for relevant\n"
-            "patterns before writing. If no knowledge base tools are available,\n"
-            "proceed without them.\n\n"
-            "Security checklist — flag any of these in the task if present:\n"
-            "- Path traversal risk (unvalidated user-supplied paths)\n"
-            "- Missing import statements that would cause NameError on run\n"
-            "- Duplicate class or function definitions\n"
-            "- Resource handles opened without context managers\n"
-            "- Unbounded loops with no exit condition\n\n"
-            f"Plan file: {plan_path}\n"
-            f"Task: {task_number}"
+        execute_system_prompt = (
+            "You are a senior software engineer implementing a single task "
+            "from a TDD plan. Output the complete implementation only. "
+            "Rules: "
+            "1. Write the failing test first, exactly as specified in the plan. "
+            "2. Write the implementation that makes it pass. "
+            "3. Output ONLY code. No preamble. No summary. No explanation. "
+            "   No 'here is the code'. No 'this implements'. "
+            "4. Every file must be complete — no ellipsis, no truncation, "
+            "   no 'rest remains unchanged'. Full file, every line. "
+            "5. End with the commit message on its own line prefixed with "
+            "   COMMIT: "
         )
 
         result = await self._run_sub_agent(
-            system_prompt=tdd_system_prompt,
+            system_prompt=execute_system_prompt,
             user_prompt=f"Execute this task:\n\n{task_block}",
             description=f"Executing task {task_number}",
             __request__=__request__,
@@ -1214,4 +1260,7 @@ Output format:
             tdd_context
             + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
+            + "\n\n[SUPERPOWERS:OUTPUT_COMPLETE] The full implementation "
+            "above is the final deliverable. Output the complete code "
+            "in a single fenced code block now. No truncation. Every line."
         )
