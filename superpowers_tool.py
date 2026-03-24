@@ -752,8 +752,10 @@ Output ONLY the markdown document. No preamble, no commentary."""
         if self.valves.COMPLEXITY == "simple":
             plan_system_prompt = (
                 "You are a senior software engineer. Write a minimal TDD "
-                "implementation plan. List tasks only. Each task: one failing "
-                "test, one implementation step, one commit. Maximum 5 tasks. "
+                "implementation plan. Each major function or component is "
+                "a separate task — never collapse the full implementation "
+                "into a single task. Minimum 3 tasks, maximum 5. Each task: "
+                "one failing test, one implementation step, one commit. "
                 "No prose. No preamble."
             )
         elif self.valves.COMPLEXITY == "complex":
@@ -1243,6 +1245,17 @@ Output format:
             tdd_context += (
                 f"\n\n[SUPERPOWERS:VALIDATION:PASSED] "
                 f"Syntax and static analysis clean."
+            )
+
+        # On final task completion, append scratch read instruction
+        total_tasks = len(re.findall(r"^### Task ", plan_content, re.MULTILINE))
+        if task_number == total_tasks:
+            tdd_context += (
+                f"\n\n[SUPERPOWERS:TASKS:COMPLETE] All tasks executed. "
+                f"Read the scratch file and output the complete final "
+                f"implementation in a single fenced code block:\n"
+                f"`shed_read zone=storage "
+                f"path=superpowers/scratch/{feature_name}.scratch`"
             )
 
         if __event_emitter__:
