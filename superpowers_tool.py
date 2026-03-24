@@ -282,13 +282,9 @@ class Tools:
         workflow without pausing or asking the user. The next step is
         indicated in the return value. Do not output text first.
         """
-        if __event_emitter__:
-            await __event_emitter__({"type": "status", "data": {"description": "Starting spec...", "done": False}})
         parts = topic_and_summary.split("|||", 1)
         topic = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else topic
-        if __event_emitter__:
-            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return await self.write_spec(
             topic, summary,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
@@ -643,7 +639,6 @@ Output format:
         workflow without pausing or asking the user. The next step is
         indicated in the return value. Do not output text first.
         """
-        self._plan_revision_count = 0
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Writing plan...", "done": False}})
         user_id = (__user__ or {}).get("id", "")
@@ -1073,6 +1068,12 @@ Output format:
 
         return issues
 
+    def _get_scratch_path(self, feature_name: str, user_id: str) -> str:
+        path, _, _ = self._resolve_path(
+            "scratch", f"{feature_name}.scratch", user_id
+        )
+        return path
+
     async def execute_task(
         self,
         plan_path: str,
@@ -1142,17 +1143,25 @@ Output format:
         task_block = "\n".join(task_lines).strip()
 
         execute_system_prompt = (
-            "You are a senior software engineer implementing a single task "
-            "from a TDD plan. Output the complete implementation only. "
-            "Rules: "
-            "1. Write the failing test first, exactly as specified in the plan. "
-            "2. Write the implementation that makes it pass. "
-            "3. Output ONLY code. No preamble. No summary. No explanation. "
-            "   No 'here is the code'. No 'this implements'. "
-            "4. Every file must be complete — no ellipsis, no truncation, "
-            "   no 'rest remains unchanged'. Full file, every line. "
-            "5. End with the commit message on its own line prefixed with "
-            "   COMMIT: "
+            "You are a senior software engineer implementing a single "
+            "task from a TDD plan.\n\n"
+            "Output format — follow this exactly:\n"
+            "1. The complete failing test file, in a fenced code block "
+            "   with the correct language tag.\n"
+            "2. The complete implementation file that makes it pass, "
+            "   in a fenced code block.\n"
+            "3. A single line starting with COMMIT: followed by the "
+            "   commit message.\n\n"
+            "Rules:\n"
+            "- Every file must be complete. No ellipsis, no truncation, "
+            "  no 'rest remains unchanged'.\n"
+            "- No preamble before the first code block.\n"
+            "- No explanation between code blocks.\n"
+            "- No prose after the COMMIT line.\n"
+            "- If the task specifies bash, write bash. If Python, write "
+            "  Python. Match the language in the plan.\n"
+            "- The test must fail before the implementation exists. "
+            "  Write it that way."
         )
 
         result = await self._run_sub_agent(
@@ -1169,61 +1178,27 @@ Output format:
             __message_id__=__message_id__,
         )
 
-        # Validate Phase 1 output before proceeding to Phase 2
-        phase1_issues = self._validate_code(result)
-        if phase1_issues:
-            issue_list = "\n".join(f"  - {iss}" for iss in phase1_issues)
-            result += (
-                f"\n\n---\n\n"
-                f"[SUPERPOWERS:VALIDATION:FAILED]\n\n"
-                f"**Static analysis found {len(phase1_issues)} issue(s) "
-                f"in generated code blocks. These must be fixed before "
-                f"running tests:**\n\n"
-                f"{issue_list}\n\n"
-                f"Fix the issues above, then re-run this task before "
-                f"proceeding to the next one."
-            )
-            combined_result = result
-        elif "[SUPERPOWERS:PHASE1:DONE]" in result:
-            phase2_system_prompt = (
-                "You are in PHASE 2: IMPLEMENTATION.\n\n"
-                "The test file from Phase 1 defines the contract. Write the\n"
-                "minimal implementation to make every test pass.\n\n"
-                "Rules:\n"
-                "- Write only what is needed to pass the tests — no extras\n"
-                "- Every import in the implementation must be explicit\n"
-                "- No duplicate class or function definitions\n"
-                "- Use context managers for all file and resource handles\n"
-                "- Validate all user-supplied paths before use (os.path.abspath,\n"
-                "  Path.resolve(), existence checks)\n"
-                "- No bare except clauses — catch specific exceptions\n"
-                "- After writing the implementation, output the git commit\n"
-                "  commands specified in the task\n\n"
-                "Before writing, check if a knowledge base is available with\n"
-                "project context or coding standards. If list_knowledge_bases or\n"
-                "query_knowledge_files tools are available, query them for\n"
-                "relevant patterns before writing. If no knowledge base tools\n"
-                "are available, proceed without them.\n\n"
-                "End your response with: [SUPERPOWERS:PHASE2:DONE]\n\n"
-                f"Plan file: {plan_path}\n"
-                f"Task: {task_number}"
-            )
-            phase2_result = await self._run_sub_agent(
-                system_prompt=phase2_system_prompt,
-                user_prompt=f"Phase 1 test output:\n\n{result}\n\nNow write the implementation.",
-                description=f"Implementing task {task_number}",
-                __request__=__request__,
-                __user__=__user__,
-                __metadata__=__metadata__,
-                __model__=__model__,
-                __event_emitter__=__event_emitter__,
-                __event_call__=__event_call__,
-                __chat_id__=__chat_id__,
-                __message_id__=__message_id__,
-            )
-            combined_result = result + "\n\n---\n\n" + phase2_result
+        combined_result = result
+
+        # Scratch file persistence
+        import re as _re
+        feature_name = os.path.basename(plan_path)
+        feature_name = _re.sub(r"^\d{4}-\d{2}-\d{2}-", "", feature_name)
+        feature_name = feature_name.removesuffix(".md")
+        scratch_path = self._get_scratch_path(feature_name, user_id)
+        if task_number == 1:
+            try:
+                with open(scratch_path, "w", encoding="utf-8") as f:
+                    f.write(f"# {feature_name} — Scratch Build\n\n")
+                    f.write(f"## Task 1\n\n{combined_result}\n\n")
+            except OSError as _e:
+                scratch_path = f"(scratch write failed: {_e})"
         else:
-            combined_result = result
+            try:
+                with open(scratch_path, "a", encoding="utf-8") as f:
+                    f.write(f"## Task {task_number}\n\n{combined_result}\n\n")
+            except OSError as _e:
+                scratch_path = f"(scratch append failed: {_e})"
 
         tdd_context = (
             f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
@@ -1242,8 +1217,13 @@ Output format:
             f"{task_block}\n\n"
             f"---\n\n"
             f"{combined_result}\n\n"
+            f"**Scratch file:** `{scratch_path}`\n"
+            f"`shed_read` it in Fileshed to see the full accumulated "
+            f"output across all tasks.\n\n"
             f"**Tip:** If Fileshed is installed, verify the plan file with:\n"
-            f"`shed_exec(zone=\"storage\", path=\"superpowers/plans/{os.path.basename(plan_path)}\", cmd=\"cat\")`"
+            f"`shed_exec(zone=\"storage\", "
+            f"path=\"superpowers/plans/{os.path.basename(plan_path)}\", "
+            f"cmd=\"cat\")`"
         )
 
         # Validate all code blocks in the combined output
