@@ -220,12 +220,22 @@ class Tools:
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Brainstorming...", "done": False}})
 
+        if self.valves.COMPLEXITY == "simple":
+            system_prompt = (
+                "You are a senior software engineer. The user has described "
+                "a task. In two sentences maximum, confirm your understanding "
+                "of what needs to be built. Do not ask questions. Do not list "
+                "features. Just confirm and stop."
+            )
+        else:
+            system_prompt = (
+                "You are a senior software architect. Ask ONE clarifying "
+                "question to refine the user's idea before spec writing. "
+                "Do not answer your own question. Do not write a spec yet."
+            )
+
         result = await self._run_sub_agent(
-            system_prompt=(
-                "You are a senior software architect. Ask ONE clarifying question to refine "
-                "the user's idea before spec writing. Do not answer your own question. "
-                "Do not write a spec yet."
-            ),
+            system_prompt=system_prompt,
             user_prompt=idea,
             description="Brainstorming",
             __request__=__request__,
@@ -240,7 +250,10 @@ class Tools:
 
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
-        return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input.\n" + mode_tag
+
+        if self.valves.COMPLEXITY == "simple":
+            return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input.\n" + mode_tag
+        return result + "\n\n" + mode_tag
 
     async def start_spec(
         self,
@@ -1260,7 +1273,4 @@ Output format:
             tdd_context
             + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
-            + "\n\n[SUPERPOWERS:OUTPUT_COMPLETE] The full implementation "
-            "above is the final deliverable. Output the complete code "
-            "in a single fenced code block now. No truncation. Every line."
         )
