@@ -24,6 +24,7 @@ License: MIT
 """
 
 import os
+import re
 import json
 import typing
 from datetime import date
@@ -1009,7 +1010,6 @@ Output format:
                        (gracefully skipped if not installed)
         """
         import ast
-        import re
 
         issues = []
 
@@ -1181,9 +1181,8 @@ Output format:
         combined_result = result
 
         # Scratch file persistence
-        import re as _re
         feature_name = os.path.basename(plan_path)
-        feature_name = _re.sub(r"^\d{4}-\d{2}-\d{2}-", "", feature_name)
+        feature_name = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", feature_name)
         feature_name = feature_name.removesuffix(".md")
         scratch_path = self._get_scratch_path(feature_name, user_id)
         if task_number == 1:
