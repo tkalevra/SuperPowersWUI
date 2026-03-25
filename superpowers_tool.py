@@ -1980,23 +1980,27 @@ Output format:
                 return "Error: command name required for -l"
             if not source:
                 return "Error: source required for -l (1=curated_kb, 2=man_pages, 3=online_docs)"
+            try:
+                source_int = int(source)
+            except (ValueError, TypeError):
+                return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+            if source_int not in (1, 2, 3):
+                return f"Error: source must be 1, 2, or 3 (got {source_int})"
 
             cache = self._load_command_cache()
 
-            if source == "1":
+            if source_int == 1:
                 result = self._check_curated_kb(command)
                 if not result:
                     return f"'{command}' not found in curated KB at `{self.valves.CURATED_KB_PATH}`"
-            elif source == "2":
+            elif source_int == 2:
                 result = self._check_man_page(command, "")
                 if not result:
                     return f"Man page not found for '{command}' (is man installed?)"
-            elif source == "3":
+            else:
                 result = self._fetch_online_docs(command)
                 if not result:
                     return f"No online documentation found for '{command}'"
-            else:
-                return f"Invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
 
             result["trust_level"] = trust_levels.get(result.get("source", "unknown"), 0.0)
             was_updated = self._update_cache_with_authority(cache, command, result)
@@ -2043,16 +2047,20 @@ Output format:
                 result["trust_level"] = trust_levels["custom_url"]
                 result["note"] = f"Sourced from {url}"
             elif source:
-                if source == "1":
+                try:
+                    source_int = int(source)
+                except (ValueError, TypeError):
+                    return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+                if source_int == 1:
                     result = self._check_curated_kb(command)
-                elif source == "2":
+                elif source_int == 2:
                     result = self._check_man_page(command, "")
-                elif source == "3":
+                elif source_int == 3:
                     result = self._fetch_online_docs(command)
                 else:
-                    return f"Invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+                    return f"Error: source must be 1, 2, or 3 (got {source_int})"
                 if not result:
-                    return f"No documentation found for '{command}' from source {source} ({source_names.get(source, '?')})"
+                    return f"No documentation found for '{command}' from source {source_int} ({source_names.get(str(source_int), '?')})"
             else:
                 # Auto: walk tiers
                 result = (
