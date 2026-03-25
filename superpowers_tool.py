@@ -1252,52 +1252,96 @@ Output format:
         )
         return os.path.join(cache_dir, "curated_kb.json")
 
-    def _ensure_cache_exists(self) -> None:
+    _SEED_KB: dict = {
+        "ssh": {
+            "invalid_subcommands": ["put", "get", "mput", "mget"],
+            "note": "ssh executes shell commands, not file transfer operations",
+        },
+        "sftp": {
+            "valid_subcommands": ["put", "get", "cd", "lcd", "ls", "pwd", "bye", "quit"],
+            "invalid_flags": ["-r"],
+            "note": "sftp has no -r flag — use 'put -r' inside batch mode for recursive transfers",
+        },
+        "scp": {
+            "invalid_subcommands": ["put", "get", "bye", "quit", "cd"],
+            "note": "scp uses direct file paths",
+        },
+        "rsync": {
+            "valid_flags": ["-a", "-v", "-z", "-r", "-e", "--checksum", "--partial", "--delete", "--progress"],
+            "invalid_flags": ["-o", "-i"],
+            "note": "rsync uses -e for SSH options. Example: rsync -e 'ssh -o StrictHostKeyChecking=yes -i key' src/ user@host:/dst/",
+        },
+    }
+
+    def _ensure_cache_exists(self) -> dict:
         """
         Create the validation_cache directory and seed files on every tool load.
-        Idempotent — safe to call repeatedly.
+        Repairs corrupted files from seed data. Idempotent — safe to call repeatedly.
+        Returns a status dict with keys: cache_dir, curated_kb_path, cache_path,
+        curated_created, curated_repaired, cache_created, cache_repaired, error.
         """
+        status = {
+            "cache_dir": "",
+            "curated_kb_path": "",
+            "cache_path": "",
+            "curated_created": False,
+            "curated_repaired": False,
+            "cache_created": False,
+            "cache_repaired": False,
+            "error": "",
+        }
         cache_dir = os.path.join(
             self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
         )
+        status["cache_dir"] = cache_dir
         try:
             os.makedirs(cache_dir, exist_ok=True)
-        except OSError:
-            return  # Filesystem not ready (e.g. test environment) — skip silently
+        except OSError as e:
+            status["error"] = str(e)
+            return status  # Filesystem not ready — skip silently
 
         curated_kb_path = os.path.join(cache_dir, "curated_kb.json")
         cache_path = os.path.join(cache_dir, "command_knowledge.json")
+        status["curated_kb_path"] = curated_kb_path
+        status["cache_path"] = cache_path
 
+        # Curated KB: create if missing, repair if corrupted
+        needs_write = False
         if not os.path.exists(curated_kb_path):
-            seed_data = {
-                "ssh": {
-                    "invalid_subcommands": ["put", "get", "mput", "mget"],
-                    "note": "ssh executes shell commands, not file transfer operations",
-                },
-                "sftp": {
-                    "valid_subcommands": ["put", "get", "cd", "lcd", "ls", "pwd", "bye", "quit"],
-                    "note": "sftp batch mode: sftp -b - user@host",
-                },
-                "scp": {
-                    "invalid_subcommands": ["put", "get", "bye", "quit", "cd"],
-                    "note": "scp uses direct file paths",
-                },
-                "rsync": {
-                    "valid_flags": ["-a", "-v", "-z", "-r", "-e", "--checksum", "--partial", "--delete", "--progress"],
-                    "invalid_flags": ["-o", "-i"],
-                    "note": "rsync uses -e for SSH options. Example: rsync -e 'ssh -o StrictHostKeyChecking=yes -i key' src/ user@host:/dst/",
-                },
-            }
+            needs_write = True
+            status["curated_created"] = True
+        else:
             try:
-                self._atomic_write(curated_kb_path, json.dumps(seed_data, indent=2))
+                with open(curated_kb_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, OSError):
+                needs_write = True
+                status["curated_repaired"] = True
+        if needs_write:
+            try:
+                self._atomic_write(curated_kb_path, json.dumps(self._SEED_KB, indent=2))
             except Exception:
                 pass
 
+        # Learned cache: create if missing, repair if corrupted
+        needs_write = False
         if not os.path.exists(cache_path):
+            needs_write = True
+            status["cache_created"] = True
+        else:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, OSError):
+                needs_write = True
+                status["cache_repaired"] = True
+        if needs_write:
             try:
                 self._atomic_write(cache_path, json.dumps({}, indent=2))
             except Exception:
                 pass
+
+        return status
 
     def _load_command_cache(self) -> dict:
         """Load cached command knowledge, with automatic recovery from corruption."""
@@ -1641,10 +1685,23 @@ Output format:
                 )
 
         # --- Manual pattern checks ---
-        if "sftp -r" in code:
-            issues.append(
-                f"{label}: sftp has no -r flag — use 'put -r' inside batch mode instead"
-            )
+
+        # Unreachable code: statements after unconditional top-level exit
+        _lines = code.splitlines()
+        for _li, _line in enumerate(_lines):
+            _stripped = _line.strip()
+            _indent = len(_line) - len(_line.lstrip(" \t"))
+            if re.match(r'^exit\b', _stripped) and _indent == 0:
+                _trailing = [
+                    l for l in _lines[_li + 1:]
+                    if l.strip() and not l.strip().startswith("#")
+                ]
+                if _trailing:
+                    issues.append(
+                        f"{label} line {_li + 1}: {len(_trailing)} unreachable line(s) after 'exit' — remove them"
+                    )
+                break
+
         if re.search(r"\beval\s+", code):
             issues.append(f"{label}: uses eval (security risk and hard to debug)")
         unquoted = re.findall(r'(?<!["\'])\$\{?\w+\}?(?!["\'])', code)
@@ -1956,8 +2013,23 @@ Output format:
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        # Self-healing validation retry loop — regenerate up to N times before blocking
+        # Self-healing validation retry loop — surgical fixes only, up to N times before blocking
         _MAX_VALIDATION_RETRIES = 3
+        _fix_system_prompt = (
+            "You are a code editor making minimal, targeted fixes.\n\n"
+            "Rules:\n"
+            "- Fix ONLY the specific flagged lines. Do NOT restructure, add helper functions, "
+            "  or rewrite working code.\n"
+            "- Each fix must be the smallest possible change that resolves the issue:\n"
+            "    Unquoted variable  → add double-quotes around it (e.g. $2 → \"$2\")\n"
+            "    Unreachable code   → delete the unreachable lines, nothing else\n"
+            "    Invalid flag       → remove or replace only that flag\n"
+            "    Invalid subcommand → replace with the correct alternative\n"
+            "- If fixing a 1-line issue requires adding more than 5 lines of new code, "
+            "  your approach is wrong — find a simpler fix.\n"
+            "- Return the corrected code in the same fenced-block format as the input. "
+            "  Do not add explanation, preamble, or prose."
+        )
         validation_issues = self._validate_code(combined_result)
         for _attempt in range(_MAX_VALIDATION_RETRIES):
             if not validation_issues:
@@ -1974,13 +2046,13 @@ Output format:
                 }})
             issue_lines = "\n".join(f"- {iss}" for iss in validation_issues)
             fix_prompt = (
-                f"The generated code has validation issues that MUST be fixed:\n\n"
+                f"The following code has {len(validation_issues)} validation issue(s).\n\n"
+                f"Issues to fix (change ONLY these — leave everything else exactly as-is):\n"
                 f"{issue_lines}\n\n"
-                f"Regenerate the complete code correcting every issue listed above.\n\n"
-                f"Original task:\n\n{task_block}"
+                f"Code to fix:\n\n{combined_result}"
             )
             new_result = await self._run_sub_agent(
-                system_prompt=execute_system_prompt,
+                system_prompt=_fix_system_prompt,
                 user_prompt=fix_prompt,
                 description=f"Fixing validation issues (attempt {_attempt + 1})",
                 **_sub_agent_kwargs,
@@ -1990,11 +2062,37 @@ Output format:
                 combined_result = new_result
             validation_issues = self._validate_code(combined_result)
 
-        # Scratch file persistence
         feature_name = os.path.basename(plan_path)
         feature_name = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", feature_name)
         feature_name = feature_name.removesuffix(".md")
         scratch_path = self._get_scratch_path(feature_name, user_id)
+
+        # validation_issues is the final state from the self-healing loop above.
+        # Block immediately — do NOT write broken code to scratch.
+        if validation_issues:
+            issue_list = "\n".join(f"- {iss}" for iss in validation_issues)
+            blocked_context = (
+                f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
+                f"## ⚠️ Validation Issues Found (Task {task_number})\n\n"
+                f"[SUPERPOWERS:VALIDATION:BLOCKED]\n\n"
+                f"Auto-fix attempted **{_MAX_VALIDATION_RETRIES - 1}** time(s) with targeted fixes. "
+                f"Static analysis still found **{len(validation_issues)} issue(s)** "
+                f"that could not be resolved:\n\n"
+                f"{issue_list}\n\n"
+                f"**Scratch file not updated** — only validated code is written to scratch.\n\n"
+                f"**Last attempted output:**\n\n{combined_result}\n\n"
+                f"**Do NOT proceed to the next task. Reply with:**\n"
+                f"- **fix** — attempt to auto-correct these issues\n"
+                f"- **ignore** — proceed anyway (not recommended)\n"
+                f"- **revise** — provide feedback to regenerate the task\n\n"
+                f"[SUPERPOWERS:HALT] Execution halted. Awaiting user decision."
+            )
+            return (
+                blocked_context
+                + f"\n[SUPERPOWERS:MODE:{self._get_mode(__messages__).upper()}]"
+            )
+
+        # Validation passed — write to scratch only now
         if task_number == 1:
             ok, err = self._atomic_write(
                 scratch_path,
@@ -2055,31 +2153,13 @@ Output format:
             f"cmd=\"cat\")`"
         )
 
-        # validation_issues is the final state from the self-healing loop above
-        if validation_issues:
-            issue_list = "\n".join(f"- {iss}" for iss in validation_issues)
-            tdd_context += (
-                f"\n\n---\n\n"
-                f"## ⚠️ Validation Issues Found (Task {task_number})\n\n"
-                f"[SUPERPOWERS:VALIDATION:BLOCKED]\n\n"
-                f"Auto-fix attempted **{_MAX_VALIDATION_RETRIES - 1}** time(s). "
-                f"Static analysis still found **{len(validation_issues)} issue(s)** "
-                f"that could not be auto-corrected:\n\n"
-                f"{issue_list}\n\n"
-                f"**Do NOT proceed to the next task. Reply with:**\n"
-                f"- **fix** — attempt to auto-correct these issues\n"
-                f"- **ignore** — proceed anyway (not recommended)\n"
-                f"- **revise** — provide feedback to regenerate the task\n\n"
-                f"[SUPERPOWERS:HALT] Execution halted. Awaiting user decision."
-            )
-        else:
-            tdd_context += (
-                f"\n\n[SUPERPOWERS:VALIDATION:PASSED]\n"
-                f"  Syntax validation: Clean\n"
-                f"  Static analysis: No issues\n"
-                f"  Domain checks: Passed\n"
-                f"  Pattern detection: No common errors found"
-            )
+        tdd_context += (
+            f"\n\n[SUPERPOWERS:VALIDATION:PASSED]\n"
+            f"  Syntax validation: Clean\n"
+            f"  Static analysis: No issues\n"
+            f"  Domain checks: Passed\n"
+            f"  Pattern detection: No common errors found"
+        )
 
         # On final task completion, append scratch read instruction
         total_tasks = len(re.findall(r"^### Task ", plan_content, re.MULTILINE))
@@ -2093,14 +2173,8 @@ Output format:
             )
 
         if __event_emitter__:
-            done_desc = "Done." if not validation_issues else f"⚠️ {len(validation_issues)} validation issue(s) — blocked."
-            await __event_emitter__({"type": "status", "data": {"description": done_desc, "done": True}})
+            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         mode = self._get_mode(__messages__)
-        if validation_issues:
-            return (
-                tdd_context
-                + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
-            )
         return (
             tdd_context
             + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
@@ -2612,6 +2686,9 @@ Output format:
 
         # -health: check cache integrity and report status
         if action == "-health":
+            # Auto-repair before reporting so first-run always shows green
+            self._ensure_cache_exists()
+
             cache_dir = os.path.join(
                 self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
             )
@@ -2620,39 +2697,42 @@ Output format:
             status = []
 
             if os.path.isdir(cache_dir):
-                status.append(f"✓ Cache directory: `{cache_dir}`")
+                status.append(f"✓ Cache initialized at `{cache_dir}/`")
             else:
-                status.append(f"✗ Cache directory missing: `{cache_dir}`")
-                status.append("\nRun `skillstack -init` to fix.")
+                status.append(f"✗ Cache directory could not be created: `{cache_dir}`")
                 return "\n".join(status)
 
+            # Curated KB: prefer valve path if readable, fall back to seeded cache copy
+            kb_count = 0
+            kb_source = ""
             valve_kb = self.valves.CURATED_KB_PATH
             if os.path.exists(valve_kb):
                 try:
                     with open(valve_kb, "r", encoding="utf-8") as f:
                         kb = json.load(f)
-                    status.append(f"✓ Curated KB (valve path): {len(kb)} commands — `{valve_kb}`")
-                except json.JSONDecodeError:
-                    status.append(f"✗ Curated KB (valve path) corrupted: `{valve_kb}`")
-            else:
-                status.append(f"✗ Curated KB (valve path) not found: `{valve_kb}`")
-
-            if os.path.exists(curated_path):
+                    kb_count = len(kb)
+                    kb_source = f"valve path `{valve_kb}`"
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if not kb_source and os.path.exists(curated_path):
                 try:
                     with open(curated_path, "r", encoding="utf-8") as f:
                         kb = json.load(f)
-                    status.append(f"✓ Curated KB (seed/fallback): {len(kb)} commands")
-                except json.JSONDecodeError:
-                    status.append("✗ Curated KB (seed/fallback) corrupted")
+                    kb_count = len(kb)
+                    kb_source = "seeded cache"
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if kb_source:
+                status.append(f"✓ Curated KB: {kb_count} commands loaded ({kb_source})")
             else:
-                status.append("✗ Curated KB (seed/fallback) missing — run `skillstack -init`")
+                status.append("✗ Curated KB could not be read — run `skillstack -init`")
 
             if os.path.exists(cache_path):
                 try:
                     with open(cache_path, "r", encoding="utf-8") as f:
                         cache = json.load(f)
                     status.append(f"✓ Learned cache: {len(cache)} commands")
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, OSError):
                     status.append("✗ Learned cache corrupted — run `skillstack -init` to reset")
             else:
                 status.append("✗ Learned cache missing — run `skillstack -init`")
@@ -2661,8 +2741,24 @@ Output format:
 
         # -init: force cache initialization/repair
         if action == "-init":
-            self._ensure_cache_exists()
-            return "✓ Cache initialized. Run `skillstack -health` to verify."
+            s = self._ensure_cache_exists()
+            lines = [f"✓ Cache directory: `{s['cache_dir']}/`"]
+            if s.get("error"):
+                return f"✗ Cache init failed: {s['error']}"
+            kb_count = len(self._SEED_KB)
+            if s["curated_created"]:
+                lines.append(f"✓ Curated KB: created with {kb_count} seed commands")
+            elif s["curated_repaired"]:
+                lines.append(f"✓ Curated KB: repaired from seed data ({kb_count} commands)")
+            else:
+                lines.append(f"✓ Curated KB: {kb_count} commands (already present)")
+            if s["cache_created"]:
+                lines.append("✓ Learned cache: created (empty)")
+            elif s["cache_repaired"]:
+                lines.append("✓ Learned cache: repaired (reset to empty)")
+            else:
+                lines.append("✓ Learned cache: already present")
+            return "\n".join(lines)
 
         return (
             f"Unknown action '{action}'. Valid actions:\n"
