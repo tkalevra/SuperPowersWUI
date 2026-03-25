@@ -1056,9 +1056,9 @@ Output format:
 
         # Extract all ```python ... ``` blocks from the content
         code_blocks = re.findall(
-            r"```python\s*\n(.*?)```",
+            r"^\s*```python\s*\n(.*?)\n\s*```",
             content,
-            re.DOTALL
+            re.DOTALL | re.MULTILINE
         )
 
         if not code_blocks:
@@ -1116,6 +1116,9 @@ Output format:
         cleaned_content has markdown fences stripped on success.
         output_type: "spec", "plan", or "raw"
         """
+        if not content or len(content.strip()) < 50:
+            return False, content
+
         refusal_phrases = [
             "i cannot", "i apologize", "i'm sorry", "i am sorry",
             "i'm unable", "i am unable", "i don't think i can",
@@ -1156,19 +1159,23 @@ Output format:
         dir_name = os.path.dirname(path)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=dir_name)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
-                os.replace(tmp_path, path)
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
         except OSError as e:
             return False, str(e)
-        return True, ""
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, path)
+            return True, ""
+        except Exception as e:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False, str(e)
 
     def _get_scratch_path(self, feature_name: str, user_id: str) -> str:
         path, _, _ = self._resolve_path(
@@ -1308,13 +1315,25 @@ Output format:
                     f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
                 )
         else:
-            try:
-                with open(scratch_path, "a", encoding="utf-8") as f:
-                    f.write(f"## Task {task_number}\n\n{combined_result}\n\n")
-            except OSError as _e:
+            existing = ""
+            if os.path.exists(scratch_path):
+                try:
+                    with open(scratch_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                except OSError as _e:
+                    return (
+                        f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                        f"Could not read scratch file `{scratch_path}`: {_e}"
+                        f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                    )
+            ok, err = self._atomic_write(
+                scratch_path,
+                existing + f"## Task {task_number}\n\n{combined_result}\n\n"
+            )
+            if not ok:
                 return (
                     f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
-                    f"Could not append to scratch file `{scratch_path}`: {_e}"
+                    f"Could not write scratch file `{scratch_path}`: {err}"
                     f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
                 )
 
