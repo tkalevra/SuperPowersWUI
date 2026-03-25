@@ -10,5 +10,9 @@
   "scp": {
     "invalid_subcommands": ["put", "get", "bye", "quit", "cd"],
     "note": "scp uses direct file paths, not interactive subcommands"
+  },
+  "rsync": {
+    "valid_flags": ["-a", "-v", "-z", "-r", "-e", "-n", "--dry-run", "--checksum", "--partial", "--delete", "--progress"],
+    "note": "Use -e for SSH transport options: rsync -e 'ssh -o StrictHostKeyChecking=yes -i keyfile' src/ user@host:/dst/"
   }
 }

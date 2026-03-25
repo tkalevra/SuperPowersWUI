@@ -1261,33 +1261,75 @@ Output format:
             pass
 
     def _fetch_online_docs(self, command: str) -> dict:
-        """Fetch command documentation from online sources (tldr → man7.org)."""
+        """
+        Fetch from authoritative online sources.
+        Priority: official project docs → man7.org → die.net (groff plaintext).
+        tldr-pages are NOT used: they are simplified human tutorials, not
+        authoritative flag references, and produce false positives in validation.
+        """
         import urllib.request
         import urllib.error
 
-        # Try tldr pages (GitHub raw content — simple format, easy to parse)
-        tldr_url = (
-            f"https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/common/{command}.md"
-        )
-        for url in [
-            tldr_url,
-            f"https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/linux/{command}.md",
-        ]:
+        # Official project documentation (plaintext groff/troff where available)
+        official_docs: dict = {
+            "rsync": "https://download.samba.org/pub/rsync/rsync.1",
+        }
+
+        # Linux man-pages project (HTML — strip tags before parsing)
+        man7_urls: dict = {
+            "rsync": "https://man7.org/linux/man-pages/man1/rsync.1.html",
+            "ssh":   "https://man7.org/linux/man-pages/man1/ssh.1.html",
+            "sftp":  "https://man7.org/linux/man-pages/man1/sftp.1.html",
+            "scp":   "https://man7.org/linux/man-pages/man1/scp.1.html",
+            "curl":  "https://man7.org/linux/man-pages/man1/curl.1.html",
+            "wget":  "https://man7.org/linux/man-pages/man1/wget.1.html",
+            "tar":   "https://man7.org/linux/man-pages/man1/tar.1.html",
+            "find":  "https://man7.org/linux/man-pages/man1/find.1.html",
+            "grep":  "https://man7.org/linux/man-pages/man1/grep.1.html",
+        }
+
+        # die.net mirrors groff plaintext — cleaner flag extraction than HTML
+        dienet_url = f"https://linux.die.net/man/1/{command}"
+
+        candidates = []
+        if command in official_docs:
+            candidates.append(("official", official_docs[command]))
+        if command in man7_urls:
+            candidates.append(("man7.org", man7_urls[command]))
+        candidates.append(("die.net", dienet_url))
+
+        for source_label, url in candidates:
             try:
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    text = resp.read().decode("utf-8", errors="replace")
-                flags = list(set(re.findall(r"`[^`]*\s(-[a-zA-Z])\b", text)))
-                subcommands = list(set(re.findall(r"`[^`]*\s(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget)\b", text)))
-                if flags or subcommands:
-                    return {
-                        "valid_flags": sorted(flags),
-                        "valid_subcommands": sorted(subcommands),
-                        "source": "online_docs",
-                        "cached_at": date.today().isoformat(),
-                        "note": f"Sourced from tldr-pages: {url}",
-                    }
-            except (urllib.error.URLError, Exception):
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "superpowers-owui/1.0 (command validation)"},
+                )
+                with urllib.request.urlopen(req, timeout=self.valves.VALIDATION_TIMEOUT) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+            except Exception:
                 continue
+
+            # Strip HTML if needed
+            text = re.sub(r"<[^>]+>", " ", raw) if "<" in raw else raw
+            # Collapse whitespace so multi-line option blocks parse cleanly
+            text = re.sub(r"[ \t]+", " ", text)
+
+            # Extract single-char flags from OPTIONS / SYNOPSIS sections
+            flags = list(set(re.findall(r"\s(-[a-zA-Z])\b", text)))
+            # Long flags (--word)
+            long_flags = list(set(re.findall(r"(--[a-z][a-z0-9-]+)", text)))
+            subcommands = list(set(re.findall(
+                r"\b(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget|mkdir|rmdir)\b", text
+            )))
+
+            if flags or long_flags:
+                return {
+                    "valid_flags": sorted(flags + long_flags),
+                    "valid_subcommands": sorted(subcommands),
+                    "source": "online_docs",
+                    "cached_at": date.today().isoformat(),
+                    "note": f"Sourced from {source_label}: {url}",
+                }
 
         return None
 
