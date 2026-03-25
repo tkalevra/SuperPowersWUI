@@ -98,6 +98,21 @@ class Tools:
                 "implementation code in a sandboxed environment to verify TDD cycle."
             ),
         )
+        ENABLE_MAN_PAGE_VALIDATION: bool = Field(
+            default=True,
+            description=(
+                "Query man pages for command validation as a fallback when a command "
+                "is not in the curated KB. Requires man to be available in the container."
+            ),
+        )
+        CURATED_KB_PATH: str = Field(
+            default="/mnt/skills/public/bash-validation/curated_kb.json",
+            description=(
+                "Path to the curated bash command knowledge base JSON file. "
+                "For non-Docker installs, point this at the curated_kb.json "
+                "included in the SuperpowersWUI repo under bash-validation/."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1202,12 +1217,199 @@ Output format:
 
         return issues
 
+    def _get_command_cache_path(self) -> str:
+        """Global cache shared across all users/projects."""
+        cache_dir = os.path.join(
+            self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, "command_knowledge.json")
+
+    def _load_command_cache(self) -> dict:
+        """Load cached command knowledge."""
+        cache_path = self._get_command_cache_path()
+        if not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _update_cache_with_authority(self, cache: dict, command: str, new_data: dict) -> bool:
+        """
+        Update cache only if new source has higher or equal authority.
+        Returns True if cache was updated.
+        Trust hierarchy: curated_kb (1.0) > man_pages (0.9) > online_docs (0.8)
+        """
+        trust_levels = {
+            "curated_kb": 1.0,
+            "man_pages": 0.9,
+            "online_docs": 0.8,
+            "unknown": 0.0,
+        }
+        new_trust = trust_levels.get(new_data.get("source", "unknown"), 0.0)
+
+        if command not in cache:
+            cache[command] = new_data
+            cache[command]["trust_level"] = new_trust
+            return True
+
+        existing_trust = cache[command].get("trust_level", 0.0)
+
+        if new_trust > existing_trust:
+            cache[command].update(new_data)
+            cache[command]["trust_level"] = new_trust
+            return True
+
+        if new_trust == existing_trust:
+            updated = False
+            for key in ("valid_flags", "invalid_flags", "valid_subcommands", "invalid_subcommands"):
+                if key in new_data:
+                    existing_set = set(cache[command].get(key, []))
+                    new_set = set(new_data.get(key, []))
+                    merged = existing_set | new_set
+                    if merged != existing_set:
+                        cache[command][key] = sorted(merged)
+                        updated = True
+            return updated
+
+        return False
+
+    def _check_curated_kb(self, command: str) -> dict:
+        """Check human-curated knowledge base."""
+        kb_path = self.valves.CURATED_KB_PATH
+        try:
+            with open(kb_path, "r", encoding="utf-8") as f:
+                kb = json.load(f)
+            if command in kb:
+                result = kb[command].copy()
+                result["source"] = "curated_kb"
+                result["cached_at"] = date.today().isoformat()
+                return result
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+
+    def _check_man_page(self, command: str, args: str) -> dict:
+        """Parse man page to extract valid/invalid flags and subcommands."""
+        import subprocess
+
+        if not self.valves.ENABLE_MAN_PAGE_VALIDATION:
+            return None
+
+        try:
+            result = subprocess.run(
+                ["man", command],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode != 0:
+                return None
+
+            man_text = result.stdout
+
+            flags_section = re.search(
+                r"OPTIONS(.*?)(?:EXAMPLES|DESCRIPTION|SEE ALSO|$)",
+                man_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            valid_flags = []
+            if flags_section:
+                valid_flags = list(set(re.findall(r"\s-([a-zA-Z])\b", flags_section.group(1))))
+
+            commands_section = re.search(
+                r"(INTERACTIVE )?COMMANDS(.*?)(?:EXAMPLES|OPTIONS|SEE ALSO|$)",
+                man_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            valid_subcommands = []
+            if commands_section:
+                valid_subcommands = list(set(re.findall(
+                    r"^\s+(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget|mkdir|rmdir)\b",
+                    commands_section.group(2),
+                    re.MULTILINE,
+                )))
+
+            used_flags = re.findall(r"-([a-zA-Z])", args)
+            used_subcommands = re.findall(
+                r"\b(put|get|mput|mget|cd|lcd|ls|pwd|bye|quit|mkdir|rmdir)\b", args
+            )
+
+            return {
+                "valid_flags": [f"-{f}" for f in valid_flags],
+                "invalid_flags": [f"-{f}" for f in used_flags if f not in valid_flags],
+                "valid_subcommands": valid_subcommands,
+                "invalid_subcommands": [c for c in used_subcommands if c not in valid_subcommands],
+                "source": "man_pages",
+                "cached_at": date.today().isoformat(),
+            }
+
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+
     def _validate_bash(self, code: str, label: str) -> list:
-        """Bash/shell: shellcheck if available, plus manual pattern checks."""
+        """Bash/shell: cache-driven command validation + shellcheck + manual pattern checks."""
         import subprocess
         import json as _json
         issues = []
 
+        # --- Cache-driven command validation ---
+        cache = self._load_command_cache()
+        cache_updated = False
+
+        bash_keywords = {
+            "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
+            "case", "esac", "function", "in", "return", "local", "export",
+            "echo", "read", "exit", "true", "false", "set", "unset", "shift",
+        }
+        all_commands = set(re.findall(r'\b([a-z][a-z0-9_-]+)\b', code))
+        external_commands = all_commands - bash_keywords
+
+        for cmd in external_commands:
+            pattern = rf'\b{re.escape(cmd)}\b\s+(.*?)(?:\n|;|&&|\|\||$)'
+            match = re.search(pattern, code)
+            if not match:
+                continue
+            args = match.group(1).strip()
+
+            # Tier 1: curated KB
+            new_validation = self._check_curated_kb(cmd)
+            # Tier 2: man pages on cache miss
+            if not new_validation:
+                new_validation = self._check_man_page(cmd, args)
+
+            if new_validation:
+                if self._update_cache_with_authority(cache, cmd, new_validation):
+                    cache_updated = True
+
+            if cmd in cache:
+                cmd_info = cache[cmd]
+                if cmd_info.get("trust_level", 0.0) >= 0.8:
+                    source = cmd_info.get("source", "unknown")
+                    for flag in cmd_info.get("invalid_flags", []):
+                        if flag in args:
+                            issues.append(
+                                f"{label}: {cmd} {flag} is not a valid flag (source: {source})"
+                            )
+                    for subcmd in cmd_info.get("invalid_subcommands", []):
+                        if re.search(rf'\b{re.escape(subcmd)}\b', args):
+                            note = cmd_info.get("note", "check man page")
+                            issues.append(
+                                f"{label}: '{cmd} {subcmd}' — {note} (source: {source})"
+                            )
+
+        if cache_updated:
+            try:
+                self._atomic_write(
+                    self._get_command_cache_path(),
+                    json.dumps(cache, indent=2)
+                )
+            except Exception:
+                pass  # Non-fatal
+
+        # --- shellcheck ---
         if self.valves.ENABLE_SHELLCHECK:
             try:
                 result = subprocess.run(
@@ -1232,7 +1434,7 @@ Output format:
                     f"{label}: shellcheck timed out (>{self.valves.VALIDATION_TIMEOUT}s)"
                 )
 
-        # Manual pattern checks (always run regardless of shellcheck)
+        # --- Manual pattern checks ---
         if "sftp -r" in code:
             issues.append(
                 f"{label}: sftp has no -r flag — use 'put -r' inside batch mode instead"
@@ -1245,21 +1447,18 @@ Output format:
                 f"{label}: {len(unquoted)} potentially unquoted variable(s) "
                 f"(word splitting risk): {', '.join(unquoted[:5])}"
             )
-
-        # Local command substitution in remote path variables
         if re.search(r'(REMOTE|DEST|TARGET|SSH).*PATH.*=.*\$\((whoami|hostname|pwd|id)\)', code):
             issues.append(
                 f"{label}: command substitution in remote path variable runs locally, not on remote host"
             )
-
-        # Variables used but never defined in this block
         declared = set(re.findall(r'\b([A-Z_][A-Z0-9_]*)=', code))
         used = set(re.findall(r'\$\{?([A-Z_][A-Z0-9_]*)\}?', code))
-        common_env = {'PATH', 'HOME', 'USER', 'PWD', 'SHELL', 'TERM', 'LANG', 'LC_ALL'}
+        common_env = {"PATH", "HOME", "USER", "PWD", "SHELL", "TERM", "LANG", "LC_ALL"}
         undefined = (used - declared) - common_env
         if undefined:
             issues.append(
-                f"{label}: variables used but not defined in this block: {', '.join(sorted(undefined)[:5])}"
+                f"{label}: variables used but not defined in this block: "
+                f"{', '.join(sorted(undefined)[:5])}"
             )
 
         return issues

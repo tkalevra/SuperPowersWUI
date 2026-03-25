@@ -1,0 +1,14 @@
+{
+  "ssh": {
+    "invalid_subcommands": ["put", "get", "mput", "mget"],
+    "note": "ssh executes shell commands, not file transfer operations"
+  },
+  "sftp": {
+    "valid_subcommands": ["put", "get", "cd", "lcd", "ls", "pwd", "bye", "quit"],
+    "note": "sftp batch mode: sftp -b - user@host"
+  },
+  "scp": {
+    "invalid_subcommands": ["put", "get", "bye", "quit", "cd"],
+    "note": "scp uses direct file paths, not interactive subcommands"
+  }
+}
