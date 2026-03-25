@@ -105,6 +105,21 @@ class Tools:
                 "is not in the curated KB. Requires man to be available in the container."
             ),
         )
+        AUTO_REVALIDATE_AFTER_LEARN: bool = Field(
+            default=True,
+            description=(
+                "After a successful -l learn, scan recent conversation messages for "
+                "bash/shell code that uses the newly learned command and report any issues."
+            ),
+        )
+        BATCH_LEARN_MODE: bool = Field(
+            default=False,
+            description=(
+                "Disable auto-revalidation during batch learning. Toggle at runtime with "
+                "'skillstack -batch on/off'. Re-enable and run 'skillstack -revalidate' "
+                "when done to check all recently learned commands at once."
+            ),
+        )
         CURATED_KB_PATH: str = Field(
             default="/mnt/skills/public/bash-validation/curated_kb.json",
             description=(
@@ -118,6 +133,8 @@ class Tools:
         self.valves = self.Valves()
         self.MAX_PLAN_REVISIONS = 2
         self._plan_revision_count = 0
+        self._recently_learned: list = []
+        self._batch_mode: bool = None  # None = use valve; True/False = runtime override
 
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
         if self.valves.FILESHED_COMPATIBLE and user_id:
@@ -1929,6 +1946,30 @@ Output format:
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
         )
 
+    def _extract_recent_code_from_context(self, messages: list) -> str:
+        """
+        Scan recent conversation messages (most-recent first) for bash/shell
+        fenced code blocks. Returns the first non-empty block found, or "".
+        """
+        if not messages:
+            return ""
+        for msg in reversed(messages):
+            content = ""
+            if isinstance(msg, dict):
+                c = msg.get("content", "")
+                content = c if isinstance(c, str) else ""
+            if not content:
+                continue
+            blocks = re.findall(
+                r"^\s*```(?:bash|sh|shell)\s*\n(.*?)\n\s*```",
+                content,
+                re.DOTALL | re.MULTILINE,
+            )
+            for block in reversed(blocks):
+                if block.strip():
+                    return block
+        return ""
+
     async def skillstack(
         self,
         action: str,
@@ -2007,12 +2048,30 @@ Output format:
 
             if was_updated:
                 self._save_command_cache(cache)
-                return (
+                self._recently_learned.append(command)
+                msg = (
                     f"Learned '{command}' from {result['source']} "
                     f"(trust={result['trust_level']:.1f})\n"
                     f"Valid flags: {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
-                    f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}"
+                    f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}\n"
                 )
+                batch_active = self._batch_mode if self._batch_mode is not None else self.valves.BATCH_LEARN_MODE
+                if self.valves.AUTO_REVALIDATE_AFTER_LEARN and not batch_active:
+                    code = self._extract_recent_code_from_context(__messages__)
+                    if code and command in code:
+                        issues = self._validate_bash(code, f"post-learn:{command}")
+                        if issues:
+                            msg += f"\n[AUTO-REVALIDATE] Issues found after learning '{command}':\n"
+                            for issue in issues:
+                                msg += f"  - {issue}\n"
+                            msg += "\nFix these before proceeding."
+                        else:
+                            msg += f"\n[AUTO-REVALIDATE] '{command}' usage in recent code looks clean."
+                    else:
+                        msg += f"\n[AUTO-REVALIDATE] '{command}' not found in recent code — no re-check needed."
+                elif batch_active:
+                    msg += "\nBatch mode active — auto-revalidation disabled. Run `skillstack -revalidate` when done."
+                return msg
             else:
                 existing_trust = cache.get(command, {}).get("trust_level", 0.0)
                 new_trust = result.get("trust_level", 0.0)
@@ -2262,8 +2321,42 @@ Output format:
                 return "## Cache Validation Issues\n\n" + "\n".join(f"- {i}" for i in issues)
             return f"Cache validated: {len(cache)} commands, no issues."
 
+        # -batch: runtime toggle for batch learn mode (overrides valve)
+        if action == "-batch":
+            if command in ("on", "1", "true"):
+                self._batch_mode = True
+                self._recently_learned.clear()
+                return (
+                    "Batch mode ON — auto-revalidation disabled.\n"
+                    "Learn commands with `-l`, then run `skillstack -revalidate` when done."
+                )
+            if command in ("off", "0", "false"):
+                self._batch_mode = False
+                learned = list(self._recently_learned)
+                return (
+                    f"Batch mode OFF — auto-revalidation re-enabled.\n"
+                    f"Commands learned this batch: {', '.join(learned) if learned else 'none'}.\n"
+                    f"Run `skillstack -revalidate` to check recent code against all of them."
+                )
+            return "Usage: skillstack -batch on  |  skillstack -batch off"
+
+        # -revalidate: manual scan of recent context against all cached knowledge
+        if action == "-revalidate":
+            code = self._extract_recent_code_from_context(__messages__)
+            if not code:
+                return "No bash/shell code found in recent messages — nothing to validate."
+            issues = self._validate_bash(code, "revalidate")
+            learned = list(self._recently_learned)
+            header = ""
+            if learned:
+                header = f"Checking against recently learned: {', '.join(learned)}\n\n"
+            if issues:
+                return header + "## Validation Issues\n\n" + "\n".join(f"- {i}" for i in issues)
+            return header + "No validation issues found."
+
         return (
             f"Unknown action '{action}'. Valid actions:\n"
-            f"  -l (learn)   -d (delete)  -r (refresh)  -s (stats)\n"
-            f"  -i (inspect) -export      -import       -validate"
+            f"  -l (learn)      -d (delete)   -r (refresh)    -s (stats)\n"
+            f"  -i (inspect)    -export       -import         -validate\n"
+            f"  -batch on/off   -revalidate"
         )
