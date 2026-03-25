@@ -1246,6 +1246,22 @@ Output format:
                 f"(word splitting risk): {', '.join(unquoted[:5])}"
             )
 
+        # Local command substitution in remote path variables
+        if re.search(r'(REMOTE|DEST|TARGET|SSH).*PATH.*=.*\$\((whoami|hostname|pwd|id)\)', code):
+            issues.append(
+                f"{label}: command substitution in remote path variable runs locally, not on remote host"
+            )
+
+        # Variables used but never defined in this block
+        declared = set(re.findall(r'\b([A-Z_][A-Z0-9_]*)=', code))
+        used = set(re.findall(r'\$\{?([A-Z_][A-Z0-9_]*)\}?', code))
+        common_env = {'PATH', 'HOME', 'USER', 'PWD', 'SHELL', 'TERM', 'LANG', 'LC_ALL'}
+        undefined = (used - declared) - common_env
+        if undefined:
+            issues.append(
+                f"{label}: variables used but not defined in this block: {', '.join(sorted(undefined)[:5])}"
+            )
+
         return issues
 
     def _validate_javascript(self, code: str, label: str) -> list:
