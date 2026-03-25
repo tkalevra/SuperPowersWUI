@@ -1975,19 +1975,16 @@ Output format:
         execute_system_prompt = (
             "You are a senior software engineer implementing a single "
             "task from a TDD plan.\n\n"
-            "Output format — follow this exactly:\n"
-            "1. The complete failing test file, in a fenced code block "
-            "   with the correct language tag.\n"
-            "2. The complete implementation file that makes it pass, "
-            "   in a fenced code block.\n"
-            "3. A single line starting with COMMIT: followed by the "
-            "   commit message.\n\n"
+            "Output format — follow this EXACTLY, no exceptions:\n"
+            "1. One fenced code block containing the complete test file.\n"
+            "2. One fenced code block containing the complete implementation file.\n"
+            "3. A single line starting with COMMIT: followed by the commit message.\n\n"
+            "If you have reasoning, questions, or concerns: discard them. Output\n"
+            "only the three items above. Nothing before the first code block.\n"
+            "Nothing between code blocks. Nothing after the COMMIT line.\n\n"
             "Rules:\n"
             "- Every file must be complete. No ellipsis, no truncation, "
             "  no 'rest remains unchanged'.\n"
-            "- No preamble before the first code block.\n"
-            "- No explanation between code blocks.\n"
-            "- No prose after the COMMIT line.\n"
             "- If the task specifies bash, write bash. If Python, write "
             "  Python. Match the language in the plan.\n"
             "- The test must fail before the implementation exists. "
@@ -2179,11 +2176,9 @@ Output format:
         total_tasks = len(re.findall(r"^### Task ", plan_content, re.MULTILINE))
         if task_number == total_tasks:
             tdd_context += (
-                f"\n\n[SUPERPOWERS:TASKS:COMPLETE] All tasks executed. "
-                f"Read the scratch file and output the complete final "
-                f"implementation in a single fenced code block:\n"
-                f"`shed_read zone=storage "
-                f"path=superpowers/scratch/{feature_name}.scratch`"
+                f"\n\n[SUPERPOWERS:TASKS:COMPLETE] All tasks done. Do not write code. "
+                f"Tell the user tasks are complete and direct them to read the scratch "
+                f"file in Fileshed."
             )
 
         if __event_emitter__:
@@ -2776,10 +2771,22 @@ Output format:
                 lines.append("✓ Learned cache: already present")
             return "\n".join(lines)
 
+        if action == "-dump":
+            cache = self._load_command_cache()
+            if not cache:
+                return "Cache is empty."
+            if command:
+                if command not in cache:
+                    return f"'{command}' not in cache."
+                data = {command: cache[command]}
+            else:
+                data = cache
+            return f"```json\n{json.dumps(data, indent=2)}\n```"
+
         return (
             f"Unknown action '{action}'. Valid actions:\n"
             f"  -l (learn)      -d (delete)   -r (refresh)    -s (stats)\n"
             f"  -i (inspect)    -export       -import         -audit\n"
             f"  -validate       -revalidate   -batch on/off   -health\n"
-            f"  -init"
+            f"  -init           -dump               dump cache contents as JSON (optional: -dump <command>)"
         )
