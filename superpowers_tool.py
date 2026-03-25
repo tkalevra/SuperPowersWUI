@@ -1724,6 +1724,14 @@ Output format:
                 f"{', '.join(sorted(undefined)[:5])}"
             )
 
+        # Empty heredoc detection
+        for m in re.finditer(r"<<-?'?(\w+)'?\n((?:(?!\1\b).*\n)*)\1\b", code, re.DOTALL):
+            delimiter, body = m.group(1), m.group(2)
+            if not body.strip():
+                issues.append(
+                    f"{label}: empty heredoc body — no commands between <<{delimiter} and {delimiter}"
+                )
+
         return issues
 
     def _validate_javascript(self, code: str, label: str) -> list:
