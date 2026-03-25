@@ -1236,6 +1236,68 @@ Output format:
         except (OSError, json.JSONDecodeError):
             return {}
 
+    def _save_command_cache(self, cache: dict) -> None:
+        """Atomically persist the command cache to disk. Non-fatal on failure."""
+        try:
+            self._atomic_write(self._get_command_cache_path(), json.dumps(cache, indent=2))
+        except Exception:
+            pass
+
+    def _fetch_online_docs(self, command: str) -> dict:
+        """Fetch command documentation from online sources (tldr → man7.org)."""
+        import urllib.request
+        import urllib.error
+
+        # Try tldr pages (GitHub raw content — simple format, easy to parse)
+        tldr_url = (
+            f"https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/common/{command}.md"
+        )
+        for url in [
+            tldr_url,
+            f"https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/linux/{command}.md",
+        ]:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                flags = list(set(re.findall(r"`[^`]*\s(-[a-zA-Z])\b", text)))
+                subcommands = list(set(re.findall(r"`[^`]*\s(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget)\b", text)))
+                if flags or subcommands:
+                    return {
+                        "valid_flags": sorted(flags),
+                        "valid_subcommands": sorted(subcommands),
+                        "source": "online_docs",
+                        "cached_at": date.today().isoformat(),
+                        "note": f"Sourced from tldr-pages: {url}",
+                    }
+            except (urllib.error.URLError, Exception):
+                continue
+
+        return None
+
+    def _fetch_from_url(self, command: str, url: str) -> dict:
+        """Fetch and parse command documentation from a custom URL."""
+        import urllib.request
+        import urllib.error
+
+        try:
+            with urllib.request.urlopen(url, timeout=self.valves.VALIDATION_TIMEOUT) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            # Strip HTML tags if present
+            text = re.sub(r"<[^>]+>", " ", text)
+            flags = list(set(re.findall(r"\s(-[a-zA-Z])\b", text)))
+            subcommands = list(set(re.findall(
+                r"\b(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget|mkdir|rmdir)\b", text
+            )))
+            return {
+                "valid_flags": sorted(flags),
+                "valid_subcommands": sorted(subcommands),
+                "source": "online_docs",
+                "cached_at": date.today().isoformat(),
+                "note": f"Sourced from {url}",
+            }
+        except Exception:
+            return None
+
     def _update_cache_with_authority(self, cache: dict, command: str, new_data: dict) -> bool:
         """
         Update cache only if new source has higher or equal authority.
@@ -1388,11 +1450,22 @@ Output format:
                 cmd_info = cache[cmd]
                 if cmd_info.get("trust_level", 0.0) >= 0.8:
                     source = cmd_info.get("source", "unknown")
-                    for flag in cmd_info.get("invalid_flags", []):
-                        if flag in args:
-                            issues.append(
-                                f"{label}: {cmd} {flag} is not a valid flag (source: {source})"
-                            )
+                    valid_flags = cmd_info.get("valid_flags", [])
+                    if valid_flags:
+                        # Allowlist: flag anything not in the known-good set
+                        used_flags = re.findall(r'-([a-zA-Z])', args)
+                        for flag in used_flags:
+                            if f"-{flag}" not in valid_flags:
+                                issues.append(
+                                    f"{label}: {cmd} -{flag} not in known valid flags (source: {source})"
+                                )
+                    else:
+                        # Blocklist fallback for entries that only have invalid_flags
+                        for flag in cmd_info.get("invalid_flags", []):
+                            if flag in args:
+                                issues.append(
+                                    f"{label}: {cmd} {flag} is not a valid flag (source: {source})"
+                                )
                     for subcmd in cmd_info.get("invalid_subcommands", []):
                         if re.search(rf'\b{re.escape(subcmd)}\b', args):
                             note = cmd_info.get("note", "check man page")
@@ -1854,4 +1927,219 @@ Output format:
             tdd_context
             + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
+        )
+
+    async def skillstack(
+        self,
+        action: str,
+        command: str = None,
+        source: str = None,
+        url: str = None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+        __messages__: list = None,
+    ) -> str:
+        """
+        Interactive management of the bash command validation knowledge base.
+
+        Args:
+            action: Operation to perform: -l (learn), -d (delete), -r (refresh), -s (stats), -i (inspect)
+            command: Command name to operate on (required for all actions except -s)
+            source: Learning source: 1=curated_kb, 2=man_pages, 3=online_docs
+            url: Custom documentation URL (used with -r to fetch from a specific page)
+
+        Examples:
+            skillstack -l rsync 2       -- learn rsync from man pages
+            skillstack -l curl 3        -- learn curl from online docs
+            skillstack -r rsync         -- auto-refresh rsync from best source
+            skillstack -r rsync 2       -- force refresh from man pages
+            skillstack -r rsync -u https://example.com/rsync.1  -- refresh from URL
+            skillstack -i rsync         -- inspect cached data for rsync
+            skillstack -s               -- show cache statistics
+            skillstack -d rsync         -- delete rsync from cache
+        """
+        trust_levels = {
+            "curated_kb": 1.0,
+            "man_pages": 0.9,
+            "online_docs": 0.8,
+            "custom_url": 0.7,
+            "unknown": 0.0,
+        }
+        source_names = {"1": "curated_kb", "2": "man_pages", "3": "online_docs"}
+
+        # -l: learn a command from a specific source
+        if action == "-l":
+            if not command:
+                return "Error: command name required for -l"
+            if not source:
+                return "Error: source required for -l (1=curated_kb, 2=man_pages, 3=online_docs)"
+
+            cache = self._load_command_cache()
+
+            if source == "1":
+                result = self._check_curated_kb(command)
+                if not result:
+                    return f"'{command}' not found in curated KB at `{self.valves.CURATED_KB_PATH}`"
+            elif source == "2":
+                result = self._check_man_page(command, "")
+                if not result:
+                    return f"Man page not found for '{command}' (is man installed?)"
+            elif source == "3":
+                result = self._fetch_online_docs(command)
+                if not result:
+                    return f"No online documentation found for '{command}'"
+            else:
+                return f"Invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+
+            result["trust_level"] = trust_levels.get(result.get("source", "unknown"), 0.0)
+            was_updated = self._update_cache_with_authority(cache, command, result)
+
+            if was_updated:
+                self._save_command_cache(cache)
+                return (
+                    f"Learned '{command}' from {result['source']} "
+                    f"(trust={result['trust_level']:.1f})\n"
+                    f"Valid flags: {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
+                    f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}"
+                )
+            else:
+                existing_trust = cache.get(command, {}).get("trust_level", 0.0)
+                new_trust = result.get("trust_level", 0.0)
+                return (
+                    f"Not updated: existing entry has higher authority "
+                    f"({existing_trust:.1f} >= {new_trust:.1f}). "
+                    f"Use -d to delete first, or -r to force refresh."
+                )
+
+        # -d: delete a command from cache
+        if action == "-d":
+            if not command:
+                return "Error: command name required for -d"
+            cache = self._load_command_cache()
+            if command not in cache:
+                return f"'{command}' not in cache"
+            old = cache.pop(command)
+            self._save_command_cache(cache)
+            return f"Deleted '{command}' (was from {old.get('source', 'unknown')}, trust={old.get('trust_level', 0.0):.1f})"
+
+        # -r: refresh command knowledge, optionally from a specific source or URL
+        if action == "-r":
+            if not command:
+                return "Error: command name required for -r"
+            cache = self._load_command_cache()
+
+            if url:
+                result = self._fetch_from_url(command, url)
+                if not result:
+                    return f"Failed to fetch documentation from {url}"
+                result["source"] = "online_docs"
+                result["trust_level"] = trust_levels["custom_url"]
+                result["note"] = f"Sourced from {url}"
+            elif source:
+                if source == "1":
+                    result = self._check_curated_kb(command)
+                elif source == "2":
+                    result = self._check_man_page(command, "")
+                elif source == "3":
+                    result = self._fetch_online_docs(command)
+                else:
+                    return f"Invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+                if not result:
+                    return f"No documentation found for '{command}' from source {source} ({source_names.get(source, '?')})"
+            else:
+                # Auto: walk tiers
+                result = (
+                    self._check_curated_kb(command)
+                    or self._check_man_page(command, "")
+                    or self._fetch_online_docs(command)
+                )
+                if not result:
+                    return f"No documentation found for '{command}' from any source"
+
+            result.setdefault("trust_level", trust_levels.get(result.get("source", "unknown"), 0.0))
+            # Force-replace regardless of existing trust
+            cache[command] = result
+            self._save_command_cache(cache)
+            return (
+                f"Refreshed '{command}' from {result['source']} "
+                f"(trust={result['trust_level']:.1f})\n"
+                f"Valid flags: {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
+                f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}"
+            )
+
+        # -s: show cache statistics
+        if action == "-s":
+            cache = self._load_command_cache()
+            total = len(cache)
+            if total == 0:
+                return "Cache is empty. Use `skillstack -l <command> <source>` to populate it."
+
+            by_source: dict = {}
+            by_trust = {"high (>=0.9)": 0, "medium (0.7-0.9)": 0, "low (<0.7)": 0}
+            for data in cache.values():
+                src = data.get("source", "unknown")
+                by_source[src] = by_source.get(src, 0) + 1
+                trust = data.get("trust_level", 0.0)
+                if trust >= 0.9:
+                    by_trust["high (>=0.9)"] += 1
+                elif trust >= 0.7:
+                    by_trust["medium (0.7-0.9)"] += 1
+                else:
+                    by_trust["low (<0.7)"] += 1
+
+            lines = [
+                f"## Command Knowledge Cache\n",
+                f"**Total commands:** {total}\n",
+                f"**Cache path:** `{self._get_command_cache_path()}`\n",
+                f"\n**By source:**",
+            ]
+            for src, count in sorted(by_source.items(), key=lambda x: -x[1]):
+                lines.append(f"  {src}: {count}")
+            lines.append("\n**By trust level:**")
+            for level, count in by_trust.items():
+                lines.append(f"  {level}: {count}")
+            lines.append(f"\n**Commands:** {', '.join(sorted(cache.keys()))}")
+            return "\n".join(lines)
+
+        # -i: inspect a specific command
+        if action == "-i":
+            if not command:
+                return "Error: command name required for -i"
+            cache = self._load_command_cache()
+            if command not in cache:
+                return (
+                    f"No cached data for '{command}'. "
+                    f"Use `skillstack -l {command} 2` to learn from man pages."
+                )
+            data = cache[command]
+            lines = [
+                f"## {command}\n",
+                f"**Source:** {data.get('source', 'unknown')}  "
+                f"**Trust:** {data.get('trust_level', 0.0):.1f}  "
+                f"**Cached:** {data.get('cached_at', 'unknown')}\n",
+            ]
+            valid_flags = data.get("valid_flags", [])
+            valid_subcmds = data.get("valid_subcommands", [])
+            invalid_subcmds = data.get("invalid_subcommands", [])
+            if valid_flags:
+                lines.append(f"**Valid flags:** {', '.join(valid_flags)}")
+            else:
+                lines.append("**Valid flags:** (none recorded — all flags pass validation)")
+            if valid_subcmds:
+                lines.append(f"**Valid subcommands:** {', '.join(valid_subcmds)}")
+            if invalid_subcmds:
+                lines.append(f"**Invalid subcommands:** {', '.join(invalid_subcmds)}")
+            if "note" in data:
+                lines.append(f"\n**Note:** {data['note']}")
+            return "\n".join(lines)
+
+        return (
+            f"Unknown action '{action}'. Valid actions: -l (learn), -d (delete), "
+            f"-r (refresh), -s (stats), -i (inspect)"
         )
