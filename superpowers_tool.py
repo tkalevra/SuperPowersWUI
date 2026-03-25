@@ -1991,7 +1991,13 @@ Output format:
             "- If the task specifies bash, write bash. If Python, write "
             "  Python. Match the language in the plan.\n"
             "- The test must fail before the implementation exists. "
-            "  Write it that way."
+            "  Write it that way.\n"
+            "- Never write stub implementations. Every function must have "
+            "  a complete, working body. `pass`, `raise NotImplementedError`, "
+            "  and placeholder comments like '# stub' or '# TODO' are forbidden.\n"
+            "- Every heredoc body must contain at least one command. An <<EOF "
+            "  block with nothing between the opening and closing delimiter "
+            "  is forbidden."
         )
 
         _sub_agent_kwargs = dict(
