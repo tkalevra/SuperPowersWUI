@@ -134,9 +134,17 @@ class Tools:
         __event_call__,
         __chat_id__: str,
         __message_id__: str,
+        max_retries: int = 2,
     ) -> str:
+        import asyncio
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import UserModel
+
+        _refusal_phrases = [
+            "i cannot", "i apologize", "i'm sorry", "i am sorry",
+            "i'm unable", "i am unable", "i don't think i can",
+            "i am not able", "i can't",
+        ]
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -144,21 +152,32 @@ class Tools:
         ]
         model_id = ((__metadata__ or {}).get("model") or {}).get("id", "") or (__model__ or {}).get("id", "")
 
-        try:
-            response = await generate_chat_completion(
-                request=__request__,
-                form_data={
-                    "model": model_id,
-                    "messages": messages,
-                    "stream": False,
-                    "metadata": {"task": "superpowers_sub_agent"},
-                },
-                user=UserModel(**__user__),
-                bypass_filter=True,
-            )
-            return response["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"[SUPERPOWERS:ERROR] {e}"
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                await asyncio.sleep(1.5 ** attempt)
+            try:
+                response = await generate_chat_completion(
+                    request=__request__,
+                    form_data={
+                        "model": model_id,
+                        "messages": messages,
+                        "stream": False,
+                        "metadata": {"task": "superpowers_sub_agent"},
+                    },
+                    user=UserModel(**__user__),
+                    bypass_filter=True,
+                )
+                content = response["choices"][0]["message"]["content"]
+                preview = content[:500].lower()
+                if any(phrase in preview for phrase in _refusal_phrases):
+                    continue
+                return content
+            except Exception as e:
+                if attempt >= max_retries:
+                    return f"[SUPERPOWERS:ERROR] {e}"
+                continue
+
+        return "[SUPERPOWERS:ERROR] Sub-agent refused after all retry attempts."
 
     # -------------------------------------------------------------------------
     # Tool functions
@@ -417,23 +436,21 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        # Strip fenced code block wrapper if the model added one
-        cleaned = spec_content.strip()
-        if cleaned.startswith("```markdown"):
-            cleaned = cleaned[len("```markdown"):].lstrip("\n")
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:].lstrip("\n")
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].rstrip()
-
-        # Save to disk
-        try:
-            with open(spec_path, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-        except OSError as e:
+        # Validate and strip fenced code block wrapper
+        valid, cleaned = self._validate_output(spec_content, "spec")
+        if not valid:
             return (
-                f"[SUPERPOWERS:PHASE:SPEC_ERROR]\n\n"
-                f"Could not save spec file to `{spec_path}`: {e}"
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Spec sub-agent output failed validation (refusal or missing required sections)."
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
+
+        # Save to disk atomically
+        ok, err = self._atomic_write(spec_path, cleaned)
+        if not ok:
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Could not save spec file to `{spec_path}`: {err}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -542,7 +559,11 @@ Output format:
             with open(read_path, "r", encoding="utf-8") as f:
                 spec_content = f.read()
         except OSError as e:
-            return f"ERROR: Could not read spec file `{read_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Could not read spec file `{read_path}`: {e}"
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
 
         review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
@@ -562,6 +583,14 @@ Output format:
             return (
                 f"**Reviewer sub-agent failed:**\n\n{review}\n\n"
                 f"Review the spec manually at `{spec_path}`, then say **\"write the plan\"** to proceed."
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
+
+        valid, review = self._validate_output(review, "raw")
+        if not valid:
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Spec reviewer sub-agent output failed validation (refusal detected)."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -650,7 +679,7 @@ Output format:
                 spec_content = f.read()
         except OSError as e:
             return (
-                f"[SUPERPOWERS:PHASE:PLAN_ERROR]\n\n"
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
                 f"Could not read spec file `{read_spec_path}`: {e}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
@@ -794,22 +823,20 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
-        # Strip fenced code block wrapper if present
-        cleaned = plan_content.strip()
-        if cleaned.startswith("```markdown"):
-            cleaned = cleaned[len("```markdown"):].lstrip("\n")
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:].lstrip("\n")
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].rstrip()
-
-        try:
-            with open(plan_path, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-        except OSError as e:
+        # Validate and strip fenced code block wrapper
+        valid, cleaned = self._validate_output(plan_content, "plan")
+        if not valid:
             return (
-                f"[SUPERPOWERS:PHASE:PLAN_ERROR]\n\n"
-                f"Could not save plan file to `{plan_path}`: {e}"
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Plan sub-agent output failed validation (refusal or missing required structure)."
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
+
+        ok, err = self._atomic_write(plan_path, cleaned)
+        if not ok:
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Could not save plan file to `{plan_path}`: {err}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -910,7 +937,11 @@ Output format:
             with open(read_path, "r", encoding="utf-8") as f:
                 plan_content = f.read()
         except OSError as e:
-            return f"ERROR: Could not read plan file `{read_path}`: {e}\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Could not read plan file `{read_path}`: {e}"
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
 
         review = await self._run_sub_agent(
             system_prompt=reviewer_system_prompt,
@@ -930,6 +961,14 @@ Output format:
             return (
                 f"**Reviewer sub-agent failed:**\n\n{review}\n\n"
                 f"Review the plan manually at `{plan_path}`, then say **\"execute task 1\"** to begin."
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
+
+        valid, review = self._validate_output(review, "raw")
+        if not valid:
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Plan reviewer sub-agent output failed validation (refusal detected)."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -1070,6 +1109,67 @@ Output format:
 
         return issues
 
+    def _validate_output(self, content: str, output_type: str) -> tuple:
+        """
+        Validate sub-agent output for refusals and required structure.
+        Returns (is_valid: bool, cleaned_content: str).
+        cleaned_content has markdown fences stripped on success.
+        output_type: "spec", "plan", or "raw"
+        """
+        refusal_phrases = [
+            "i cannot", "i apologize", "i'm sorry", "i am sorry",
+            "i'm unable", "i am unable", "i don't think i can",
+            "i am not able", "i can't",
+        ]
+        preview = content[:500].lower()
+        for phrase in refusal_phrases:
+            if phrase in preview:
+                return False, content
+
+        # Strip fenced code block wrapper
+        cleaned = content.strip()
+        if cleaned.startswith("```markdown"):
+            cleaned = cleaned[len("```markdown"):].lstrip("\n")
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:].lstrip("\n")
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].rstrip()
+
+        if output_type == "spec":
+            required = ["## Goal", "## Approach", "## Requirements"]
+            for marker in required:
+                if marker not in cleaned:
+                    return False, cleaned
+
+        elif output_type == "plan":
+            if "### Task 1:" not in cleaned or "Step" not in cleaned:
+                return False, cleaned
+
+        return True, cleaned
+
+    def _atomic_write(self, path: str, content: str) -> tuple:
+        """
+        Write content to path atomically using a temp file + os.replace().
+        Returns (True, "") on success, (False, error_msg) on failure.
+        """
+        import tempfile
+        dir_name = os.path.dirname(path)
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.replace(tmp_path, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            return False, str(e)
+        return True, ""
+
     def _get_scratch_path(self, feature_name: str, user_id: str) -> str:
         path, _, _ = self._resolve_path(
             "scratch", f"{feature_name}.scratch", user_id
@@ -1113,8 +1213,8 @@ Output format:
                 plan_content = f.read()
         except OSError as e:
             return (
-                f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
-                f"ERROR: Could not read plan file `{read_path}`: {e}"
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Could not read plan file `{read_path}`: {e}"
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
 
@@ -1182,24 +1282,41 @@ Output format:
 
         combined_result = result
 
+        # Validate sub-agent output before writing anything
+        valid, combined_result = self._validate_output(combined_result, "raw")
+        if not valid:
+            return (
+                f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                f"Execute sub-agent output failed validation (refusal detected) for task {task_number}."
+                f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            )
+
         # Scratch file persistence
         feature_name = os.path.basename(plan_path)
         feature_name = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", feature_name)
         feature_name = feature_name.removesuffix(".md")
         scratch_path = self._get_scratch_path(feature_name, user_id)
         if task_number == 1:
-            try:
-                with open(scratch_path, "w", encoding="utf-8") as f:
-                    f.write(f"# {feature_name} — Scratch Build\n\n")
-                    f.write(f"## Task 1\n\n{combined_result}\n\n")
-            except OSError as _e:
-                scratch_path = f"(scratch write failed: {_e})"
+            ok, err = self._atomic_write(
+                scratch_path,
+                f"# {feature_name} — Scratch Build\n\n## Task 1\n\n{combined_result}\n\n"
+            )
+            if not ok:
+                return (
+                    f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                    f"Could not write scratch file `{scratch_path}`: {err}"
+                    f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                )
         else:
             try:
                 with open(scratch_path, "a", encoding="utf-8") as f:
                     f.write(f"## Task {task_number}\n\n{combined_result}\n\n")
             except OSError as _e:
-                scratch_path = f"(scratch append failed: {_e})"
+                return (
+                    f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n"
+                    f"Could not append to scratch file `{scratch_path}`: {_e}"
+                    f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+                )
 
         tdd_context = (
             f"[SUPERPOWERS:PHASE:EXECUTING:TASK_{task_number}]\n\n"
