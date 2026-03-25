@@ -2177,7 +2177,9 @@ Output format:
         mode = self._get_mode(__messages__)
         return (
             tdd_context
-            + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
+            + f"\n\n[SUPERPOWERS:TASK:COMPLETE] Task {task_number} done. "
+            + f"Call execute_task with task_number={task_number + 1} when ready, "
+            + f"or say 'done' if this was the last task."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
         )
 
