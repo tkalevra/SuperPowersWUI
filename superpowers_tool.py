@@ -1935,6 +1935,7 @@ Output format:
         command: str = None,
         source: str = None,
         url: str = None,
+        mode: str = "merge",
         __user__: dict = None,
         __metadata__: dict = None,
         __event_emitter__: typing.Callable[[dict], typing.Any] = None,
@@ -2139,7 +2140,122 @@ Output format:
                 lines.append(f"\n**Note:** {data['note']}")
             return "\n".join(lines)
 
+        # -export: write entire cache to a temp file for sharing
+        if action == "-export":
+            import time
+            cache = self._load_command_cache()
+            if not cache:
+                return "Cache is empty — nothing to export."
+            export_data = {
+                "exported_at": date.today().isoformat(),
+                "exported_by": (__user__ or {}).get("name", "unknown"),
+                "command_count": len(cache),
+                "commands": cache,
+            }
+            export_path = f"/tmp/skillstack_export_{int(time.time())}.json"
+            try:
+                self._atomic_write(export_path, json.dumps(export_data, indent=2))
+            except Exception as e:
+                return f"Export failed: {e}"
+            return (
+                f"Exported {len(cache)} commands to `{export_path}`\n\n"
+                f"Share this file with others. They can import it with:\n"
+                f"`skillstack -import merge` (respects authority) or\n"
+                f"`skillstack -import replace` (force overwrite)"
+            )
+
+        # -import: merge or replace cache from an uploaded export file
+        if action == "-import":
+            uploaded_files = (__user__ or {}).get("files", [])
+            if not uploaded_files:
+                return "Error: no file uploaded. Attach a skillstack export JSON file to the message."
+            import_file = uploaded_files[0].get("path")
+            if not import_file:
+                return "Error: could not read uploaded file path."
+            try:
+                with open(import_file, "r", encoding="utf-8") as f:
+                    import_data = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                return f"Error: invalid JSON file: {e}"
+            if "commands" not in import_data:
+                return "Error: invalid export format (missing 'commands' key)."
+            if mode not in ("merge", "replace"):
+                return f"Error: invalid mode '{mode}'. Use 'merge' or 'replace'."
+
+            imported_commands = import_data["commands"]
+            cache = self._load_command_cache()
+            stats = {"added": 0, "upgraded": 0, "skipped": 0, "rejected": 0}
+
+            for cmd, new_data in imported_commands.items():
+                new_trust = new_data.get("trust_level", 0.0)
+                if mode == "replace":
+                    existed = cmd in cache
+                    cache[cmd] = new_data
+                    stats["upgraded" if existed else "added"] += 1
+                else:  # merge
+                    if cmd not in cache:
+                        cache[cmd] = new_data
+                        stats["added"] += 1
+                    else:
+                        existing_trust = cache[cmd].get("trust_level", 0.0)
+                        if new_trust > existing_trust:
+                            cache[cmd] = new_data
+                            stats["upgraded"] += 1
+                        elif new_trust == existing_trust:
+                            changed = False
+                            for key in ("valid_flags", "valid_subcommands", "invalid_subcommands"):
+                                if key in new_data:
+                                    merged = sorted(
+                                        set(cache[cmd].get(key, [])) | set(new_data[key])
+                                    )
+                                    if merged != cache[cmd].get(key, []):
+                                        cache[cmd][key] = merged
+                                        changed = True
+                            stats["upgraded" if changed else "skipped"] += 1
+                        else:
+                            stats["rejected"] += 1
+
+            self._save_command_cache(cache)
+            return (
+                f"## Import Complete ({mode} mode)\n\n"
+                f"**Added:** {stats['added']} new commands\n"
+                f"**Upgraded:** {stats['upgraded']} (higher or equal authority with new data)\n"
+                f"**Skipped:** {stats['skipped']} (equal authority, no new data)\n"
+                f"**Rejected:** {stats['rejected']} (lower authority than existing)\n\n"
+                f"Imported from: {import_data.get('exported_by', 'unknown')} "
+                f"({import_data.get('exported_at', 'unknown')})"
+            )
+
+        # -validate: audit cache for trust/source mismatches and missing fields
+        if action == "-validate":
+            cache = self._load_command_cache()
+            if not cache:
+                return "Cache is empty — nothing to validate."
+            expected_trust = {
+                "curated_kb": 1.0,
+                "man_pages": 0.9,
+                "online_docs": 0.8,
+                "custom_url": 0.7,
+            }
+            issues = []
+            for cmd, data in cache.items():
+                src = data.get("source", "unknown")
+                trust = data.get("trust_level", 0.0)
+                exp = expected_trust.get(src)
+                if exp is not None and trust != exp:
+                    issues.append(
+                        f"{cmd}: trust mismatch — has {trust}, expected {exp} for source '{src}'"
+                    )
+                if "cached_at" not in data:
+                    issues.append(f"{cmd}: missing cached_at timestamp")
+                if "source" not in data:
+                    issues.append(f"{cmd}: missing source field")
+            if issues:
+                return "## Cache Validation Issues\n\n" + "\n".join(f"- {i}" for i in issues)
+            return f"Cache validated: {len(cache)} commands, no issues."
+
         return (
-            f"Unknown action '{action}'. Valid actions: -l (learn), -d (delete), "
-            f"-r (refresh), -s (stats), -i (inspect)"
+            f"Unknown action '{action}'. Valid actions:\n"
+            f"  -l (learn)   -d (delete)  -r (refresh)  -s (stats)\n"
+            f"  -i (inspect) -export      -import       -validate"
         )
