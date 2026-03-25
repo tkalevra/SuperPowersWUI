@@ -26,8 +26,10 @@ License: MIT
 import os
 import re
 import json
+import time
+import shutil
 import typing
-from datetime import date
+from datetime import date, datetime, timezone
 from pydantic import BaseModel, Field
 
 
@@ -135,6 +137,7 @@ class Tools:
         self._plan_revision_count = 0
         self._recently_learned: list = []
         self._batch_mode: bool = None  # None = use valve; True/False = runtime override
+        self._ensure_cache_exists()
 
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
         if self.valves.FILESHED_COMPATIBLE and user_id:
@@ -1242,15 +1245,78 @@ Output format:
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, "command_knowledge.json")
 
+    def _get_curated_kb_cache_path(self) -> str:
+        """Path to the seeded curated KB inside the validation_cache directory."""
+        cache_dir = os.path.join(
+            self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+        )
+        return os.path.join(cache_dir, "curated_kb.json")
+
+    def _ensure_cache_exists(self) -> None:
+        """
+        Create the validation_cache directory and seed files on every tool load.
+        Idempotent — safe to call repeatedly.
+        """
+        cache_dir = os.path.join(
+            self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+        )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError:
+            return  # Filesystem not ready (e.g. test environment) — skip silently
+
+        curated_kb_path = os.path.join(cache_dir, "curated_kb.json")
+        cache_path = os.path.join(cache_dir, "command_knowledge.json")
+
+        if not os.path.exists(curated_kb_path):
+            seed_data = {
+                "ssh": {
+                    "invalid_subcommands": ["put", "get", "mput", "mget"],
+                    "note": "ssh executes shell commands, not file transfer operations",
+                },
+                "sftp": {
+                    "valid_subcommands": ["put", "get", "cd", "lcd", "ls", "pwd", "bye", "quit"],
+                    "note": "sftp batch mode: sftp -b - user@host",
+                },
+                "scp": {
+                    "invalid_subcommands": ["put", "get", "bye", "quit", "cd"],
+                    "note": "scp uses direct file paths",
+                },
+                "rsync": {
+                    "valid_flags": ["-a", "-v", "-z", "-r", "-e", "--checksum", "--partial", "--delete", "--progress"],
+                    "invalid_flags": ["-o", "-i"],
+                    "note": "rsync uses -e for SSH options. Example: rsync -e 'ssh -o StrictHostKeyChecking=yes -i key' src/ user@host:/dst/",
+                },
+            }
+            try:
+                self._atomic_write(curated_kb_path, json.dumps(seed_data, indent=2))
+            except Exception:
+                pass
+
+        if not os.path.exists(cache_path):
+            try:
+                self._atomic_write(cache_path, json.dumps({}, indent=2))
+            except Exception:
+                pass
+
     def _load_command_cache(self) -> dict:
-        """Load cached command knowledge."""
+        """Load cached command knowledge, with automatic recovery from corruption."""
         cache_path = self._get_command_cache_path()
         if not os.path.exists(cache_path):
+            self._ensure_cache_exists()
             return {}
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError:
+            backup_path = f"{cache_path}.backup.{int(time.time())}"
+            try:
+                shutil.copy(cache_path, backup_path)
+            except OSError:
+                pass
+            self._ensure_cache_exists()
+            return {}
+        except OSError:
             return {}
 
     def _save_command_cache(self, cache: dict) -> None:
@@ -1327,7 +1393,7 @@ Output format:
                     "valid_flags": sorted(flags + long_flags),
                     "valid_subcommands": sorted(subcommands),
                     "source": "online_docs",
-                    "cached_at": date.today().isoformat(),
+                    "cached_at": datetime.now(timezone.utc).isoformat(),
                     "note": f"Sourced from {source_label}: {url}",
                 }
 
@@ -1351,7 +1417,7 @@ Output format:
                 "valid_flags": sorted(flags),
                 "valid_subcommands": sorted(subcommands),
                 "source": "online_docs",
-                "cached_at": date.today().isoformat(),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
                 "note": f"Sourced from {url}",
             }
         except Exception:
@@ -1398,22 +1464,28 @@ Output format:
         return False
 
     def _check_curated_kb(self, command: str) -> dict:
-        """Check human-curated knowledge base."""
-        kb_path = self.valves.CURATED_KB_PATH
-        try:
-            with open(kb_path, "r", encoding="utf-8") as f:
-                kb = json.load(f)
-            if command in kb:
-                result = kb[command].copy()
-                result["source"] = "curated_kb"
-                result["cached_at"] = date.today().isoformat()
-                return result
-        except (OSError, json.JSONDecodeError):
-            pass
+        """Check human-curated knowledge base. Falls back to seeded cache copy."""
+        for kb_path in (self.valves.CURATED_KB_PATH, self._get_curated_kb_cache_path()):
+            try:
+                with open(kb_path, "r", encoding="utf-8") as f:
+                    kb = json.load(f)
+                if command in kb:
+                    result = kb[command].copy()
+                    result["source"] = "curated_kb"
+                    result["cached_at"] = datetime.now(timezone.utc).isoformat()
+                    return result
+            except (OSError, json.JSONDecodeError):
+                continue
         return None
 
-    def _check_man_page(self, command: str, args: str) -> dict:
-        """Parse man page to extract valid/invalid flags and subcommands."""
+    def _check_man_page(self, command: str, args: str = "") -> dict:
+        """
+        Parse man page and return complete, self-contained command data.
+
+        Returns a stable cache entry — valid flags and subcommands for the
+        command, not per-call derived fields. Includes both short (-X) and
+        long (--word) flags extracted from the OPTIONS section.
+        """
         import subprocess
 
         if not self.valves.ENABLE_MAN_PAGE_VALIDATION:
@@ -1438,7 +1510,14 @@ Output format:
             )
             valid_flags = []
             if flags_section:
-                valid_flags = list(set(re.findall(r"\s-([a-zA-Z])\b", flags_section.group(1))))
+                section = flags_section.group(1)
+                # Short flags: -X (avoid matching second char of --long)
+                short = re.findall(r"(?<!-)-([a-zA-Z])\b", section)
+                valid_flags.extend(f"-{f}" for f in short)
+                # Long flags: --word
+                long = re.findall(r"(--[a-z][a-z0-9-]+)", section)
+                valid_flags.extend(long)
+                valid_flags = sorted(set(valid_flags))
 
             commands_section = re.search(
                 r"(INTERACTIVE )?COMMANDS(.*?)(?:EXAMPLES|OPTIONS|SEE ALSO|$)",
@@ -1447,24 +1526,18 @@ Output format:
             )
             valid_subcommands = []
             if commands_section:
-                valid_subcommands = list(set(re.findall(
+                valid_subcommands = sorted(set(re.findall(
                     r"^\s+(put|get|cd|lcd|ls|pwd|bye|quit|mput|mget|mkdir|rmdir)\b",
                     commands_section.group(2),
                     re.MULTILINE,
                 )))
 
-            used_flags = re.findall(r"-([a-zA-Z])", args)
-            used_subcommands = re.findall(
-                r"\b(put|get|mput|mget|cd|lcd|ls|pwd|bye|quit|mkdir|rmdir)\b", args
-            )
-
             return {
-                "valid_flags": [f"-{f}" for f in valid_flags],
-                "invalid_flags": [f"-{f}" for f in used_flags if f not in valid_flags],
+                "valid_flags": valid_flags,
                 "valid_subcommands": valid_subcommands,
-                "invalid_subcommands": [c for c in used_subcommands if c not in valid_subcommands],
                 "source": "man_pages",
-                "cached_at": date.today().isoformat(),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+                "note": f"Extracted from man {command}",
             }
 
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -1511,8 +1584,9 @@ Output format:
                     source = cmd_info.get("source", "unknown")
                     valid_flags = cmd_info.get("valid_flags", [])
                     if valid_flags:
-                        # Allowlist: flag anything not in the known-good set
-                        used_flags = re.findall(r'-([a-zA-Z])', args)
+                        # Allowlist: flag anything not in the known-good set.
+                        # (?<!-) prevents matching the second char of --long-options.
+                        used_flags = re.findall(r'(?<!-)-([a-zA-Z])', args)
                         for flag in used_flags:
                             if f"-{flag}" not in valid_flags:
                                 issues.append(
@@ -1855,10 +1929,7 @@ Output format:
             "  Write it that way."
         )
 
-        result = await self._run_sub_agent(
-            system_prompt=execute_system_prompt,
-            user_prompt=f"Execute this task:\n\n{task_block}",
-            description=f"Executing task {task_number}",
+        _sub_agent_kwargs = dict(
             __request__=__request__,
             __user__=__user__,
             __metadata__=__metadata__,
@@ -1869,7 +1940,12 @@ Output format:
             __message_id__=__message_id__,
         )
 
-        combined_result = result
+        combined_result = await self._run_sub_agent(
+            system_prompt=execute_system_prompt,
+            user_prompt=f"Execute this task:\n\n{task_block}",
+            description=f"Executing task {task_number}",
+            **_sub_agent_kwargs,
+        )
 
         # Validate sub-agent output before writing anything
         valid, combined_result = self._validate_output(combined_result, "raw")
@@ -1879,6 +1955,40 @@ Output format:
                 f"Execute sub-agent output failed validation (refusal detected) for task {task_number}."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             )
+
+        # Self-healing validation retry loop — regenerate up to N times before blocking
+        _MAX_VALIDATION_RETRIES = 3
+        validation_issues = self._validate_code(combined_result)
+        for _attempt in range(_MAX_VALIDATION_RETRIES):
+            if not validation_issues:
+                break
+            if _attempt == _MAX_VALIDATION_RETRIES - 1:
+                break  # Exhausted — block below
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {
+                    "description": (
+                        f"Auto-fixing {len(validation_issues)} issue(s) "
+                        f"(attempt {_attempt + 1}/{_MAX_VALIDATION_RETRIES - 1})..."
+                    ),
+                    "done": False,
+                }})
+            issue_lines = "\n".join(f"- {iss}" for iss in validation_issues)
+            fix_prompt = (
+                f"The generated code has validation issues that MUST be fixed:\n\n"
+                f"{issue_lines}\n\n"
+                f"Regenerate the complete code correcting every issue listed above.\n\n"
+                f"Original task:\n\n{task_block}"
+            )
+            new_result = await self._run_sub_agent(
+                system_prompt=execute_system_prompt,
+                user_prompt=fix_prompt,
+                description=f"Fixing validation issues (attempt {_attempt + 1})",
+                **_sub_agent_kwargs,
+            )
+            _, new_result = self._validate_output(new_result, "raw")
+            if new_result and "[SUPERPOWERS:ERROR]" not in new_result:
+                combined_result = new_result
+            validation_issues = self._validate_code(combined_result)
 
         # Scratch file persistence
         feature_name = os.path.basename(plan_path)
@@ -1945,19 +2055,22 @@ Output format:
             f"cmd=\"cat\")`"
         )
 
-        # Validate all code blocks in the combined output
-        validation_issues = self._validate_code(tdd_context)
+        # validation_issues is the final state from the self-healing loop above
         if validation_issues:
-            issue_list = "\n".join(f"  - {iss}" for iss in validation_issues)
+            issue_list = "\n".join(f"- {iss}" for iss in validation_issues)
             tdd_context += (
                 f"\n\n---\n\n"
-                f"[SUPERPOWERS:VALIDATION:FAILED]\n\n"
-                f"**Static analysis found {len(validation_issues)} issue(s) "
-                f"in generated code blocks. These must be fixed before "
-                f"running tests:**\n\n"
+                f"## ⚠️ Validation Issues Found (Task {task_number})\n\n"
+                f"[SUPERPOWERS:VALIDATION:BLOCKED]\n\n"
+                f"Auto-fix attempted **{_MAX_VALIDATION_RETRIES - 1}** time(s). "
+                f"Static analysis still found **{len(validation_issues)} issue(s)** "
+                f"that could not be auto-corrected:\n\n"
                 f"{issue_list}\n\n"
-                f"Fix the issues above, then re-run this task before "
-                f"proceeding to the next one."
+                f"**Do NOT proceed to the next task. Reply with:**\n"
+                f"- **fix** — attempt to auto-correct these issues\n"
+                f"- **ignore** — proceed anyway (not recommended)\n"
+                f"- **revise** — provide feedback to regenerate the task\n\n"
+                f"[SUPERPOWERS:HALT] Execution halted. Awaiting user decision."
             )
         else:
             tdd_context += (
@@ -1980,18 +2093,25 @@ Output format:
             )
 
         if __event_emitter__:
-            await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
+            done_desc = "Done." if not validation_issues else f"⚠️ {len(validation_issues)} validation issue(s) — blocked."
+            await __event_emitter__({"type": "status", "data": {"description": done_desc, "done": True}})
         mode = self._get_mode(__messages__)
+        if validation_issues:
+            return (
+                tdd_context
+                + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
+            )
         return (
             tdd_context
             + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
         )
 
-    def _extract_recent_code_from_context(self, messages: list) -> str:
+    def _extract_recent_code_from_context(self, messages: list, user_id: str = "") -> str:
         """
         Scan recent conversation messages (most-recent first) for bash/shell
-        fenced code blocks. Returns the first non-empty block found, or "".
+        fenced code blocks or artifact file references (*.sh paths).
+        Returns the first non-empty block or file content found, or "".
         """
         if not messages:
             return ""
@@ -2002,6 +2122,7 @@ Output format:
                 content = c if isinstance(c, str) else ""
             if not content:
                 continue
+
             blocks = re.findall(
                 r"^\s*```(?:bash|sh|shell)\s*\n(.*?)\n\s*```",
                 content,
@@ -2010,6 +2131,25 @@ Output format:
             for block in reversed(blocks):
                 if block.strip():
                     return block
+
+            # Fall back to artifact file references (e.g. "saved at `sync/bidisync.sh`")
+            if user_id:
+                match = re.search(r"[`'\"]([^`'\"]+\.sh)[`'\"]", content)
+                if match:
+                    rel_path = match.group(1).lstrip("/")
+                    full_path = os.path.join(
+                        self.valves.STORAGE_BASE_PATH,
+                        "users", user_id, "Storage", "data",
+                        rel_path,
+                    )
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as fh:
+                            code = fh.read()
+                        if code.strip():
+                            return code
+                    except OSError:
+                        pass
+
         return ""
 
     async def skillstack(
@@ -2033,20 +2173,26 @@ Output format:
         Interactive management of the bash command validation knowledge base.
 
         Args:
-            action: Operation to perform: -l (learn), -d (delete), -r (refresh), -s (stats), -i (inspect)
-            command: Command name to operate on (required for all actions except -s)
+            action: Operation to perform. See examples below.
+            command: Command name or file path depending on action.
             source: Learning source: 1=curated_kb, 2=man_pages, 3=online_docs
             url: Custom documentation URL (used with -r to fetch from a specific page)
 
         Examples:
-            skillstack -l rsync 2       -- learn rsync from man pages
-            skillstack -l curl 3        -- learn curl from online docs
-            skillstack -r rsync         -- auto-refresh rsync from best source
-            skillstack -r rsync 2       -- force refresh from man pages
-            skillstack -r rsync -u https://example.com/rsync.1  -- refresh from URL
-            skillstack -i rsync         -- inspect cached data for rsync
-            skillstack -s               -- show cache statistics
-            skillstack -d rsync         -- delete rsync from cache
+            skillstack -l rsync 2          -- learn rsync from man pages
+            skillstack -l curl 3           -- learn curl from online docs
+            skillstack -r rsync            -- auto-refresh rsync from best source
+            skillstack -r rsync 2          -- force refresh from man pages
+            skillstack -r rsync -u URL     -- refresh from URL
+            skillstack -i rsync            -- inspect cached data for rsync
+            skillstack -s                  -- show cache statistics
+            skillstack -d rsync            -- delete rsync from cache
+            skillstack -validate           -- validate bash code in current conversation
+            skillstack -validate path.sh   -- validate a file from Fileshed Storage
+            skillstack -revalidate         -- alias for -validate with no args
+            skillstack -audit              -- audit cache for trust/source mismatches
+            skillstack -health             -- check cache file integrity
+            skillstack -init               -- initialise or repair cache files
         """
         trust_levels = {
             "curated_kb": 1.0,
@@ -2092,25 +2238,28 @@ Output format:
                 self._save_command_cache(cache)
                 self._recently_learned.append(command)
                 msg = (
-                    f"Learned '{command}' from {result['source']} "
-                    f"(trust={result['trust_level']:.1f})\n"
-                    f"Valid flags: {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
-                    f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}\n"
+                    f"✓ Learned '{command}' from {result['source']} "
+                    f"(trust={result['trust_level']:.1f})\n\n"
+                    f"**Valid flags:** {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
+                    f"**Valid subcommands:** {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}\n"
                 )
                 batch_active = self._batch_mode if self._batch_mode is not None else self.valves.BATCH_LEARN_MODE
                 if self.valves.AUTO_REVALIDATE_AFTER_LEARN and not batch_active:
-                    code = self._extract_recent_code_from_context(__messages__)
+                    user_id = (__user__ or {}).get("id", "")
+                    msg += "\n[AUTO-REVALIDATE] Scanning current context...\n"
+                    code = self._extract_recent_code_from_context(__messages__, user_id)
                     if code and command in code:
+                        msg += f"Found '{command}' usage in current code. Validating...\n\n"
                         issues = self._validate_bash(code, f"post-learn:{command}")
                         if issues:
-                            msg += f"\n[AUTO-REVALIDATE] Issues found after learning '{command}':\n"
+                            msg += "⚠️ **VALIDATION ISSUES FOUND:**\n"
                             for issue in issues:
                                 msg += f"  - {issue}\n"
-                            msg += "\nFix these before proceeding."
+                            msg += "\nRecommendation: Fix these issues before proceeding."
                         else:
-                            msg += f"\n[AUTO-REVALIDATE] '{command}' usage in recent code looks clean."
+                            msg += f"✓ No issues found with '{command}' usage."
                     else:
-                        msg += f"\n[AUTO-REVALIDATE] '{command}' not found in recent code — no re-check needed."
+                        msg += f"Command '{command}' not found in current context — no validation needed."
                 elif batch_active:
                     msg += "\nBatch mode active — auto-revalidation disabled. Run `skillstack -revalidate` when done."
                 return msg
@@ -2249,25 +2398,48 @@ Output format:
                 lines.append(f"\n**Note:** {data['note']}")
             return "\n".join(lines)
 
-        # -export: write entire cache to a temp file for sharing
+        # -export: write entire cache to a user-accessible file for sharing
         if action == "-export":
-            import time
             cache = self._load_command_cache()
-            if not cache:
+            curated = {}
+            try:
+                with open(self._get_curated_kb_cache_path(), "r", encoding="utf-8") as f:
+                    curated = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+            if not cache and not curated:
                 return "Cache is empty — nothing to export."
+            user_id = (__user__ or {}).get("id", "")
+            export_filename = f"skillstack_export_{int(time.time())}.json"
+            if self.valves.FILESHED_COMPATIBLE and user_id:
+                export_dir = os.path.join(
+                    self.valves.STORAGE_BASE_PATH,
+                    "users", user_id, "Storage", "data",
+                )
+            else:
+                export_dir = os.path.join(
+                    self.valves.STORAGE_BASE_PATH, "superpowers"
+                )
+            os.makedirs(export_dir, exist_ok=True)
+            export_path = os.path.join(export_dir, export_filename)
             export_data = {
+                "version": "1.0",
                 "exported_at": date.today().isoformat(),
                 "exported_by": (__user__ or {}).get("name", "unknown"),
                 "command_count": len(cache),
+                "curated_kb": curated,
                 "commands": cache,
             }
-            export_path = f"/tmp/skillstack_export_{int(time.time())}.json"
-            try:
-                self._atomic_write(export_path, json.dumps(export_data, indent=2))
-            except Exception as e:
-                return f"Export failed: {e}"
+            ok, err = self._atomic_write(export_path, json.dumps(export_data, indent=2))
+            if not ok:
+                return f"Export failed: {err}"
+            location = (
+                f"Fileshed Storage zone → `{export_filename}`"
+                if self.valves.FILESHED_COMPATIBLE and user_id
+                else f"`{export_path}`"
+            )
             return (
-                f"Exported {len(cache)} commands to `{export_path}`\n\n"
+                f"Exported {len(cache)} commands to {location}\n\n"
                 f"Share this file with others. They can import it with:\n"
                 f"`skillstack -import merge` (respects authority) or\n"
                 f"`skillstack -import replace` (force overwrite)"
@@ -2335,11 +2507,52 @@ Output format:
                 f"({import_data.get('exported_at', 'unknown')})"
             )
 
-        # -validate: audit cache for trust/source mismatches and missing fields
+        # -validate: validate bash/shell code from conversation or a saved file
         if action == "-validate":
+            user_id = (__user__ or {}).get("id", "")
+            code_to_validate = None
+            source_label = "conversation"
+
+            if command:
+                # command parameter used as relative file path under user's Storage
+                if self.valves.FILESHED_COMPATIBLE and user_id:
+                    file_path = os.path.join(
+                        self.valves.STORAGE_BASE_PATH,
+                        "users", user_id, "Storage", "data",
+                        command.lstrip("/"),
+                    )
+                else:
+                    file_path = os.path.join(
+                        self.valves.STORAGE_BASE_PATH, command.lstrip("/")
+                    )
+                try:
+                    with open(file_path, "r", encoding="utf-8") as fh:
+                        code_to_validate = fh.read()
+                    source_label = command
+                except OSError as e:
+                    return f"Error: cannot read file '{command}': {e}"
+            else:
+                code_to_validate = self._extract_recent_code_from_context(__messages__, user_id)
+                if not code_to_validate:
+                    return (
+                        "No bash/shell code found in recent conversation. "
+                        "Specify a file path to validate a saved file: `skillstack -validate path/to/file.sh`"
+                    )
+
+            issues = self._validate_bash(code_to_validate, source_label)
+            if issues:
+                lines = [f"## Validation Issues in `{source_label}`\n"]
+                for issue in issues:
+                    lines.append(f"- {issue}")
+                lines.append(f"\nTotal issues: {len(issues)}")
+                return "\n".join(lines)
+            return f"✓ No validation issues found in `{source_label}`"
+
+        # -audit: audit cache entries for trust/source mismatches and missing fields
+        if action == "-audit":
             cache = self._load_command_cache()
             if not cache:
-                return "Cache is empty — nothing to validate."
+                return "Cache is empty — nothing to audit."
             expected_trust = {
                 "curated_kb": 1.0,
                 "man_pages": 0.9,
@@ -2360,8 +2573,8 @@ Output format:
                 if "source" not in data:
                     issues.append(f"{cmd}: missing source field")
             if issues:
-                return "## Cache Validation Issues\n\n" + "\n".join(f"- {i}" for i in issues)
-            return f"Cache validated: {len(cache)} commands, no issues."
+                return "## Cache Audit Issues\n\n" + "\n".join(f"- {i}" for i in issues)
+            return f"Cache audit passed: {len(cache)} commands, no issues."
 
         # -batch: runtime toggle for batch learn mode (overrides valve)
         if action == "-batch":
@@ -2382,23 +2595,79 @@ Output format:
                 )
             return "Usage: skillstack -batch on  |  skillstack -batch off"
 
-        # -revalidate: manual scan of recent context against all cached knowledge
+        # -revalidate: alias for -validate with no args; scans recent context
         if action == "-revalidate":
-            code = self._extract_recent_code_from_context(__messages__)
+            user_id = (__user__ or {}).get("id", "")
+            code = self._extract_recent_code_from_context(__messages__, user_id)
             if not code:
                 return "No bash/shell code found in recent messages — nothing to validate."
-            issues = self._validate_bash(code, "revalidate")
+            issues = self._validate_bash(code, "conversation")
             learned = list(self._recently_learned)
             header = ""
             if learned:
                 header = f"Checking against recently learned: {', '.join(learned)}\n\n"
             if issues:
                 return header + "## Validation Issues\n\n" + "\n".join(f"- {i}" for i in issues)
-            return header + "No validation issues found."
+            return header + "✓ No validation issues found."
+
+        # -health: check cache integrity and report status
+        if action == "-health":
+            cache_dir = os.path.join(
+                self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+            )
+            curated_path = os.path.join(cache_dir, "curated_kb.json")
+            cache_path = os.path.join(cache_dir, "command_knowledge.json")
+            status = []
+
+            if os.path.isdir(cache_dir):
+                status.append(f"✓ Cache directory: `{cache_dir}`")
+            else:
+                status.append(f"✗ Cache directory missing: `{cache_dir}`")
+                status.append("\nRun `skillstack -init` to fix.")
+                return "\n".join(status)
+
+            valve_kb = self.valves.CURATED_KB_PATH
+            if os.path.exists(valve_kb):
+                try:
+                    with open(valve_kb, "r", encoding="utf-8") as f:
+                        kb = json.load(f)
+                    status.append(f"✓ Curated KB (valve path): {len(kb)} commands — `{valve_kb}`")
+                except json.JSONDecodeError:
+                    status.append(f"✗ Curated KB (valve path) corrupted: `{valve_kb}`")
+            else:
+                status.append(f"✗ Curated KB (valve path) not found: `{valve_kb}`")
+
+            if os.path.exists(curated_path):
+                try:
+                    with open(curated_path, "r", encoding="utf-8") as f:
+                        kb = json.load(f)
+                    status.append(f"✓ Curated KB (seed/fallback): {len(kb)} commands")
+                except json.JSONDecodeError:
+                    status.append("✗ Curated KB (seed/fallback) corrupted")
+            else:
+                status.append("✗ Curated KB (seed/fallback) missing — run `skillstack -init`")
+
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cache = json.load(f)
+                    status.append(f"✓ Learned cache: {len(cache)} commands")
+                except json.JSONDecodeError:
+                    status.append("✗ Learned cache corrupted — run `skillstack -init` to reset")
+            else:
+                status.append("✗ Learned cache missing — run `skillstack -init`")
+
+            return "\n".join(status)
+
+        # -init: force cache initialization/repair
+        if action == "-init":
+            self._ensure_cache_exists()
+            return "✓ Cache initialized. Run `skillstack -health` to verify."
 
         return (
             f"Unknown action '{action}'. Valid actions:\n"
             f"  -l (learn)      -d (delete)   -r (refresh)    -s (stats)\n"
-            f"  -i (inspect)    -export       -import         -validate\n"
-            f"  -batch on/off   -revalidate"
+            f"  -i (inspect)    -export       -import         -audit\n"
+            f"  -validate       -revalidate   -batch on/off   -health\n"
+            f"  -init"
         )
