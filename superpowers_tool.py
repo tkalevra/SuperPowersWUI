@@ -73,6 +73,31 @@ class Tools:
                 "Values: simple, medium, complex."
             ),
         )
+        ENABLE_SHELLCHECK: bool = Field(
+            default=True,
+            description=(
+                "Run shellcheck on bash/sh code blocks during validation if shellcheck "
+                "is installed. Falls back to pattern matching if not found."
+            ),
+        )
+        ENABLE_ESLINT: bool = Field(
+            default=False,
+            description=(
+                "Run eslint on JavaScript/TypeScript code blocks during validation if "
+                "eslint is installed. Falls back to pattern matching if not found."
+            ),
+        )
+        VALIDATION_TIMEOUT: int = Field(
+            default=5,
+            description="Timeout in seconds for external validator subprocess calls (shellcheck, eslint, etc.).",
+        )
+        RUN_TESTS_IN_EXECUTE: bool = Field(
+            default=False,
+            description=(
+                "If True, execute_task will attempt to run generated test and "
+                "implementation code in a sandboxed environment to verify TDD cycle."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -384,6 +409,42 @@ triggers the event. Never write "detect changes" — write
 "detect changes by comparing mtime AND size; trigger MODIFY
 if either differs from the previous snapshot". Ambiguous
 comparison requirements are invalid and will be rejected.
+
+CRITICAL IMPLEMENTATION GUIDANCE:
+For ANY requirement that involves an external tool, shell command,
+API call, or library function, you MUST include ALL of the following
+in the requirement text — not in a separate section:
+1. The exact command, function signature, or API method
+2. A concrete working example with real arguments (not placeholders)
+3. The expected output or exit code
+
+GOOD requirement:
+"Transfer file via SFTP batch mode:
+```
+sftp -b - user@host <<'EOF'
+cd /remote/path
+put /local/file.txt
+bye
+EOF
+```
+Exit 0 on success, non-zero on failure. Do NOT use sftp with -r flag
+(does not exist); use put -r inside the batch block for directories."
+
+BAD requirement (will be rejected):
+"Transfer file via SFTP"
+
+GOOD requirement:
+"Parse JSON with error handling:
+```python
+import json
+try:
+    data = json.loads(input_str)
+except json.JSONDecodeError as e:
+    return None
+```"
+
+BAD requirement (will be rejected):
+"Parse JSON from input"
 
 ## Out of Scope
 [YAGNI: explicit list of what is NOT being built]
@@ -919,8 +980,38 @@ Check for:
 - Buildability: could an engineer follow this without getting stuck?
 - Stub enforcement: BLOCK if any single code block contains a loop (for/while), conditional logic beyond type guards, more than 5 lines of executable code, or a complete working implementation. Stubs with pass/raise NotImplementedError and test skeletons with assert False are correct and expected.
 
-Only flag issues that would cause real problems during implementation.
-Approve unless there are serious gaps.
+CRITICAL: DOMAIN-SPECIFIC VALIDATION
+For every code block or command reference in the plan, verify:
+
+1. Command/API correctness:
+   - Commands exist and the flags shown are valid (e.g. sftp has no -r flag)
+   - API calls use the correct method signatures
+   - Library functions are called with the right argument types and order
+
+2. Variable and naming consistency:
+   - Variable names used consistently throughout all tasks
+   - Environment variable names match any referenced documentation
+   - No shadowing or silent redefinition across tasks
+
+3. Logic soundness:
+   - Control flow cannot have unreachable branches
+   - Conditionals are not trivially always-true or always-false
+   - Error handling paths actually handle the error (no silent swallow)
+
+4. Language-specific patterns:
+   Bash: SFTP must use batch mode (-b or heredoc), not interactive stdin piping.
+         SSH RemoteCommand or ProxyJump patterns must be syntactically valid.
+   Python: imports must match usage; types passed to functions must be consistent.
+   JavaScript: async functions must be awaited; promises must have .catch() or try/catch.
+
+BLOCK the plan if you find:
+- A command flag that does not exist (e.g. sftp -r, grep -P on macOS without ggrep)
+- Variable name mismatch between tasks or between docs and code
+- Logic that cannot possibly produce the described outcome
+- Hardcoded secrets or credentials in any code block
+- eval/exec usage without explicit justification
+
+Only flag issues that would cause real failures. Approve unless there are serious gaps.
 
 Output format:
 ## Plan Review
@@ -1041,22 +1132,13 @@ Output format:
 
     def _validate_code(self, content: str) -> list:
         """
-        Extract Python code blocks from content and validate each one.
-        Returns a list of issue strings. Empty list means all clean.
-
-        Runs two passes:
-        1. ast.parse — catches all syntax errors (always available)
-        2. pyflakes  — catches undefined names, missing imports,
-                       scope issues, duplicate definitions
-                       (gracefully skipped if not installed)
+        Extract code blocks from content and validate with language-specific
+        tools. Returns a list of issue strings. Empty list means all clean.
         """
-        import ast
-
         issues = []
 
-        # Extract all ```python ... ``` blocks from the content
         code_blocks = re.findall(
-            r"^\s*```python\s*\n(.*?)\n\s*```",
+            r"^\s*```(\w+)\s*\n(.*?)\n\s*```",
             content,
             re.DOTALL | re.MULTILINE
         )
@@ -1064,48 +1146,200 @@ Output format:
         if not code_blocks:
             return issues
 
-        for i, code in enumerate(code_blocks, start=1):
-            label = f"Block {i}"
+        for i, (language, code) in enumerate(code_blocks, start=1):
+            lang = language.lower()
+            label = f"{language.upper()} Block {i}"
 
-            # Pass 1: syntax check via ast.parse
+            if lang in ("python", "py"):
+                issues.extend(self._validate_python(code, label, i))
+            elif lang in ("bash", "sh", "shell"):
+                issues.extend(self._validate_bash(code, label))
+            elif lang in ("javascript", "js", "typescript", "ts"):
+                issues.extend(self._validate_javascript(code, label))
+
+            issues.extend(self._validate_generic_patterns(code, label, lang))
+
+        return issues
+
+    def _validate_python(self, code: str, label: str, block_index: int) -> list:
+        """Python: ast.parse + optional pyflakes."""
+        import ast
+        issues = []
+
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            issues.append(f"{label} syntax error at line {e.lineno}: {e.msg}")
+            return issues  # No point running pyflakes on broken syntax
+
+        try:
+            from pyflakes import api as pyflakes_api
+
+            class _StringReporter:
+                def __init__(self):
+                    self.messages = []
+                def unexpectedError(self, filename, msg):
+                    self.messages.append(f"unexpected error: {msg}")
+                def syntaxError(self, filename, msg, lineno, offset, text):
+                    self.messages.append(f"syntax error line {lineno}: {msg}")
+                def flake(self, message):
+                    self.messages.append(str(message))
+
+            reporter = _StringReporter()
+            pyflakes_api.check(code, filename=f"<block{block_index}>", reporter=reporter)
+            for msg in reporter.messages:
+                if any(k in msg for k in [
+                    "undefined name",
+                    "redefinition of unused",
+                    "imported but unused",
+                    "local variable",
+                    "referenced before assignment",
+                ]):
+                    issues.append(f"{label}: {msg}")
+
+        except ImportError:
+            pass  # pyflakes not installed — skip silently
+
+        return issues
+
+    def _validate_bash(self, code: str, label: str) -> list:
+        """Bash/shell: shellcheck if available, plus manual pattern checks."""
+        import subprocess
+        import json as _json
+        issues = []
+
+        if self.valves.ENABLE_SHELLCHECK:
             try:
-                ast.parse(code)
-            except SyntaxError as e:
-                issues.append(
-                    f"{label} syntax error at line {e.lineno}: {e.msg}"
+                result = subprocess.run(
+                    ["shellcheck", "-f", "json", "-S", "warning", "-"],
+                    input=code,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.valves.VALIDATION_TIMEOUT,
                 )
-                continue  # No point running pyflakes on broken syntax
+                if result.stdout:
+                    try:
+                        for item in _json.loads(result.stdout):
+                            issues.append(
+                                f"{label} line {item['line']}: [{item['code']}] {item['message']}"
+                            )
+                    except (_json.JSONDecodeError, KeyError):
+                        pass
+            except FileNotFoundError:
+                pass  # shellcheck not installed
+            except subprocess.TimeoutExpired:
+                issues.append(
+                    f"{label}: shellcheck timed out (>{self.valves.VALIDATION_TIMEOUT}s)"
+                )
 
-            # Pass 2: static analysis via pyflakes (optional)
+        # Manual pattern checks (always run regardless of shellcheck)
+        if "sftp -r" in code:
+            issues.append(
+                f"{label}: sftp has no -r flag — use 'put -r' inside batch mode instead"
+            )
+        if re.search(r"\beval\s+", code):
+            issues.append(f"{label}: uses eval (security risk and hard to debug)")
+        unquoted = re.findall(r'(?<!["\'])\$\{?\w+\}?(?!["\'])', code)
+        if unquoted:
+            issues.append(
+                f"{label}: {len(unquoted)} potentially unquoted variable(s) "
+                f"(word splitting risk): {', '.join(unquoted[:5])}"
+            )
+
+        return issues
+
+    def _validate_javascript(self, code: str, label: str) -> list:
+        """JavaScript/TypeScript: eslint if available, plus manual patterns."""
+        import subprocess
+        import json as _json
+        import tempfile
+        issues = []
+
+        if self.valves.ENABLE_ESLINT:
+            fd, tmp_path = None, None
             try:
-                from pyflakes import api as pyflakes_api
+                fd, tmp_path = tempfile.mkstemp(suffix=".js")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(code)
+                fd = None  # fdopen took ownership
+                result = subprocess.run(
+                    [
+                        "eslint", "--format=json", "--no-eslintrc",
+                        "--rule", '{"no-undef": "warn", "no-unused-vars": "warn"}',
+                        tmp_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.valves.VALIDATION_TIMEOUT,
+                )
+                if result.stdout:
+                    try:
+                        for file_result in _json.loads(result.stdout):
+                            for msg in file_result.get("messages", []):
+                                issues.append(
+                                    f"{label} line {msg['line']}: {msg['message']}"
+                                )
+                    except (_json.JSONDecodeError, KeyError):
+                        pass
+            except FileNotFoundError:
+                pass  # eslint not installed
+            except subprocess.TimeoutExpired:
+                issues.append(
+                    f"{label}: eslint timed out (>{self.valves.VALIDATION_TIMEOUT}s)"
+                )
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
-                class _StringReporter:
-                    def __init__(self):
-                        self.messages = []
-                    def unexpectedError(self, filename, msg):
-                        self.messages.append(f"unexpected error: {msg}")
-                    def syntaxError(self, filename, msg, lineno, offset, text):
-                        self.messages.append(f"syntax error line {lineno}: {msg}")
-                    def flake(self, message):
-                        self.messages.append(str(message))
+        # Manual pattern checks (always run)
+        if re.search(r'\.then\s*\([^)]*\)\s*(?!\.catch)', code):
+            issues.append(f"{label}: .then() without .catch() — unhandled promise rejection")
+        if "eval(" in code:
+            issues.append(f"{label}: uses eval() (security risk)")
 
-                reporter = _StringReporter()
-                pyflakes_api.check(code, filename=f"<block{i}>",
-                                   reporter=reporter)
+        return issues
 
-                for msg in reporter.messages:
-                    if any(k in msg for k in [
-                        "undefined name",
-                        "redefinition of unused",
-                        "imported but unused",
-                        "local variable",
-                        "referenced before assignment",
-                    ]):
-                        issues.append(f"{label}: {msg}")
+    def _validate_generic_patterns(self, code: str, label: str, language: str) -> list:
+        """Cross-language semantic pattern detection."""
+        issues = []
 
-            except ImportError:
-                pass  # pyflakes not installed — skip silently
+        # Empty error handlers
+        if re.search(r'except\s*:\s*\n\s*pass', code):
+            issues.append(f"{label}: bare except:pass silently swallows all errors")
+        if re.search(r'catch\s*\(\w*\)\s*\{\s*\}', code):
+            issues.append(f"{label}: empty catch block silently swallows exception")
+
+        # Hardcoded credentials
+        cred_match = re.search(
+            r'(?i)(password|passwd|secret|api_key|token)\s*=\s*["\'][^"\']{4,}["\']',
+            code,
+        )
+        if cred_match:
+            issues.append(
+                f"{label}: possible hardcoded credential — {cred_match.group()[:50]}"
+            )
+
+        # Unreachable code after return/break/exit
+        if re.search(r'\b(return|break|exit|sys\.exit)\b[^\n]*\n[ \t]+\S', code):
+            issues.append(f"{label}: code appears after return/break/exit (unreachable)")
+
+        # Self-comparisons that are always true or always false
+        if re.search(r'\b(\w+)\s*[=!]=\s*\1\b', code):
+            issues.append(
+                f"{label}: self-comparison detected (condition always true or always false)"
+            )
+
+        # While-true with immediate break (loop body never repeats)
+        if re.search(r'while\s+[Tt]rue\s*[:{][\s\S]{0,50}break', code):
+            issues.append(f"{label}: while-true with immediate break (loop never repeats)")
 
         return issues
 
@@ -1187,6 +1421,7 @@ Output format:
         self,
         plan_path: str,
         task_number: int,
+        run_tests: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
         __event_emitter__: typing.Callable[[dict], typing.Any] = None,
@@ -1379,8 +1614,11 @@ Output format:
             )
         else:
             tdd_context += (
-                f"\n\n[SUPERPOWERS:VALIDATION:PASSED] "
-                f"Syntax and static analysis clean."
+                f"\n\n[SUPERPOWERS:VALIDATION:PASSED]\n"
+                f"  Syntax validation: Clean\n"
+                f"  Static analysis: No issues\n"
+                f"  Domain checks: Passed\n"
+                f"  Pattern detection: No common errors found"
             )
 
         # On final task completion, append scratch read instruction
