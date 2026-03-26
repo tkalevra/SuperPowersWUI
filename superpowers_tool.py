@@ -1189,6 +1189,8 @@ Output format:
                 issues.extend(self._validate_python(code, label, i))
             elif lang in ("bash", "sh", "shell"):
                 issues.extend(self._validate_bash(code, label))
+            elif lang in ("powershell", "ps1", "pwsh"):
+                issues.extend(self._validate_powershell(code, label))
             elif lang in ("javascript", "js", "typescript", "ts"):
                 issues.extend(self._validate_javascript(code, label))
 
@@ -1369,6 +1371,116 @@ Output format:
             self._atomic_write(self._get_command_cache_path(), json.dumps(cache, indent=2))
         except Exception:
             pass
+
+    def _detect_language(self, code: str) -> str:
+        """Infer language from code content. Returns lowercase slug or 'unknown'."""
+        _NORMALIZE = {
+            "python2": "python", "python3": "python",
+            "sh": "bash", "zsh": "bash", "ksh": "bash", "dash": "bash",
+            "perl5": "perl", "pwsh": "powershell",
+        }
+        first_line = code.strip().split('\n')[0] if code.strip() else ""
+        shebang = re.match(r'^#!\s*\S*/env\s+(\S+)|^#!\s*\S*/(\w+)', first_line)
+        if shebang:
+            interp = (shebang.group(1) or shebang.group(2)).lower()
+            return _NORMALIZE.get(interp, interp)
+        if re.search(
+            r'\bparam\s*\(|\[CmdletBinding\(\)\]|(?:Get|Set|New|Remove|Invoke)-\w+|Write-Host|#Requires',
+            code, re.MULTILINE
+        ):
+            return "powershell"
+        if re.search(r'\bdef \w+\s*\(|\bimport \w|\bfrom \w+ import\b|if __name__', code):
+            return "python"
+        if re.search(r'\buse strict\b|\buse warnings\b|\bsub \w+\s*\{|\bmy \$', code):
+            return "perl"
+        if re.search(r'\bset -[eux]\b|\[\[ |\bfi\b|\bdone\b|\besac\b', code):
+            return "bash"
+        return "unknown"
+
+    def _get_lang_cache_path(self, lang: str) -> str:
+        """Return path to the language-specific knowledge cache file."""
+        if lang == "bash":
+            return self._get_command_cache_path()
+        cache_dir = os.path.join(
+            self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"command_knowledge_{lang}.json")
+
+    def _load_lang_cache(self, lang: str) -> dict:
+        """Load language-specific command cache. Missing file returns empty dict."""
+        if lang == "bash":
+            return self._load_command_cache()
+        path = self._get_lang_cache_path(lang)
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_lang_cache(self, lang: str, cache: dict) -> None:
+        """Persist language-specific command cache atomically. Non-fatal on failure."""
+        if lang == "bash":
+            self._save_command_cache(cache)
+            return
+        try:
+            self._atomic_write(self._get_lang_cache_path(lang), json.dumps(cache, indent=2))
+        except Exception:
+            pass
+
+    def _fetch_help_subprocess(self, cmd: list, fallback: list = None) -> dict:
+        """Run a help command, parse flags/params from stdout. Tries fallback on FileNotFoundError."""
+        import subprocess
+        for attempt in [c for c in [cmd, fallback] if c]:
+            try:
+                result = subprocess.run(
+                    attempt,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.valves.VALIDATION_TIMEOUT,
+                )
+                text = result.stdout or ""
+                flags = list(set(re.findall(r'(?<!\w)(-[a-zA-Z])\b', text)))
+                long_flags = list(set(re.findall(r'(--[a-z][a-z0-9-]+)', text)))
+                all_flags = sorted(set(flags + long_flags))
+                if all_flags:
+                    return {
+                        "valid_flags": all_flags,
+                        "source": "local_help",
+                        "cached_at": datetime.now(timezone.utc).isoformat(),
+                        "note": attempt[0],
+                    }
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                return None
+        return None
+
+    def _get_knowledge_for_command(self, command: str, lang: str, source_int: int) -> dict:
+        """Dispatch to the correct knowledge source based on lang and source_int."""
+        if source_int == 1:
+            return self._check_curated_kb(command) if lang == "bash" else None
+        if source_int == 2:
+            if lang == "bash":
+                return self._check_man_page(command, "")
+            if lang == "powershell":
+                return self._fetch_help_subprocess(
+                    ["pwsh", "-NoProfile", "-Command",
+                     f"Get-Help {command} -Full | Out-String -Width 200"],
+                    fallback=["powershell", "-NoProfile", "-Command",
+                              f"Get-Help {command} -Full | Out-String -Width 200"],
+                )
+            if lang == "python":
+                return self._fetch_help_subprocess(["python3", "-m", "pydoc", command])
+            if lang == "perl":
+                return self._fetch_help_subprocess(["perldoc", "-t", command])
+            # unknown/other: try man then online
+            return self._check_man_page(command, "") or self._fetch_online_docs(command)
+        if source_int == 3:
+            return self._fetch_online_docs(command)
+        return None
 
     def _fetch_online_docs(self, command: str) -> dict:
         """
@@ -1732,6 +1844,51 @@ Output format:
                     f"{label}: empty heredoc body — no commands between <<{delimiter} and {delimiter}"
                 )
 
+        return issues
+
+    def _validate_powershell(self, code: str, label: str) -> list:
+        """PowerShell: cache-driven cmdlet validation + manual pattern checks."""
+        issues = []
+
+        # --- Cache-driven validation ---
+        cache = self._load_lang_cache("powershell")
+        cache_updated = False
+
+        # Match Verb-Noun cmdlet patterns
+        all_cmdlets = set(re.findall(r'\b([A-Z][a-z]+-[A-Z][a-zA-Z]+)\b', code))
+        for cmdlet in all_cmdlets:
+            if cmdlet not in cache:
+                continue
+            cmd_info = cache[cmdlet]
+            valid_flags = cmd_info.get("valid_flags", [])
+            if not valid_flags:
+                continue
+            match = re.search(rf'\b{re.escape(cmdlet)}\b\s+(.*?)(?:\n|;|$)', code)
+            if match:
+                args = match.group(1)
+                for param in re.findall(r'-([A-Za-z]\w+)', args):
+                    if f"-{param}" not in valid_flags:
+                        src = cmd_info.get("source", "unknown")
+                        issues.append(
+                            f"{label}: {cmdlet} -{param} not in known valid parameters "
+                            f"(source: {src})"
+                        )
+
+        if cache_updated:
+            self._save_lang_cache("powershell", cache)
+
+        # --- Manual pattern checks ---
+        open_braces = code.count('{')
+        close_braces = code.count('}')
+        if open_braces != close_braces:
+            issues.append(
+                f"{label}: unbalanced braces ({open_braces} open, {close_braces} close)"
+            )
+        if re.search(r'\bWrite-Host\b', code):
+            issues.append(
+                f"{label}: Write-Host suppresses pipeline output — "
+                f"prefer Write-Output or Write-Verbose in library code"
+            )
         return issues
 
     def _validate_javascript(self, code: str, label: str) -> list:
@@ -2257,6 +2414,7 @@ Output format:
         source: str = None,
         url: str = None,
         mode: str = "merge",
+        lang: str = None,
         __user__: dict = None,
         __metadata__: dict = None,
         __event_emitter__: typing.Callable[[dict], typing.Any] = None,
@@ -2268,87 +2426,100 @@ Output format:
         __messages__: list = None,
     ) -> str:
         """
-        Interactive management of the bash command validation knowledge base.
+        Interactive management of the command validation knowledge base.
+        Supports arbitrary languages via per-language cache files.
 
         Args:
             action: Operation to perform. See examples below.
             command: Command name or file path depending on action.
-            source: Learning source: 1=curated_kb, 2=man_pages, 3=online_docs
+            source: Learning source: 1=curated_kb, 2=man_pages/local_help, 3=online_docs
             url: Custom documentation URL (used with -r to fetch from a specific page)
+            lang: Language slug (bash, powershell, python, perl, ...).
+                  Auto-detected from recent conversation if omitted.
 
         Examples:
-            skillstack -l rsync 2          -- learn rsync from man pages
-            skillstack -l curl 3           -- learn curl from online docs
-            skillstack -r rsync            -- auto-refresh rsync from best source
-            skillstack -r rsync 2          -- force refresh from man pages
-            skillstack -r rsync -u URL     -- refresh from URL
-            skillstack -i rsync            -- inspect cached data for rsync
-            skillstack -s                  -- show cache statistics
-            skillstack -d rsync            -- delete rsync from cache
-            skillstack -validate           -- validate bash code in current conversation
-            skillstack -validate path.sh   -- validate a file from Fileshed Storage
-            skillstack -revalidate         -- alias for -validate with no args
-            skillstack -audit              -- audit cache for trust/source mismatches
-            skillstack -health             -- check cache file integrity
-            skillstack -init               -- initialise or repair cache files
+            skillstack -l rsync 2              -- learn rsync (auto-detect lang)
+            skillstack -l Get-Service 2 powershell -- learn PS cmdlet from Get-Help
+            skillstack -r rsync                -- auto-refresh rsync from best source
+            skillstack -r rsync 2 bash         -- force refresh rsync from man pages
+            skillstack -i rsync                -- inspect cached data for rsync
+            skillstack -s                      -- show stats for all language caches
+            skillstack -d rsync                -- delete rsync from auto-detected cache
+            skillstack -dump                   -- dump all caches as JSON
+            skillstack -dump rsync bash        -- dump bash cache entry for rsync
+            skillstack -validate               -- validate code in current conversation
+            skillstack -validate path.sh       -- validate a file from Fileshed Storage
+            skillstack -revalidate             -- alias for -validate with no args
+            skillstack -audit                  -- audit bash cache for trust mismatches
+            skillstack -health                 -- check all cache file integrity
+            skillstack -init                   -- initialise or repair cache files
         """
         trust_levels = {
             "curated_kb": 1.0,
             "man_pages": 0.9,
+            "local_help": 0.9,
             "online_docs": 0.8,
             "custom_url": 0.7,
             "unknown": 0.0,
         }
-        source_names = {"1": "curated_kb", "2": "man_pages", "3": "online_docs"}
+        source_names = {"1": "curated_kb", "2": "man_pages/local_help", "3": "online_docs"}
+
+        def _resolve_lang(lang, messages, user_id):
+            """Auto-detect lang from recent context if not explicitly provided."""
+            if lang:
+                return lang
+            ctx = self._extract_recent_code_from_context(messages or [], user_id)
+            detected = self._detect_language(ctx) if ctx else "unknown"
+            return "bash" if detected in ("unknown", "") else detected
 
         # -l: learn a command from a specific source
         if action == "-l":
             if not command:
                 return "Error: command name required for -l"
             if not source:
-                return "Error: source required for -l (1=curated_kb, 2=man_pages, 3=online_docs)"
+                return "Error: source required for -l (1=curated_kb, 2=man_pages/local_help, 3=online_docs)"
             try:
                 source_int = int(source)
             except (ValueError, TypeError):
-                return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
+                return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages/local_help, 3=online_docs"
             if source_int not in (1, 2, 3):
                 return f"Error: source must be 1, 2, or 3 (got {source_int})"
 
-            cache = self._load_command_cache()
+            user_id = (__user__ or {}).get("id", "")
+            lang = _resolve_lang(lang, __messages__, user_id)
+            cache = self._load_lang_cache(lang)
+            result = self._get_knowledge_for_command(command, lang, source_int)
 
-            if source_int == 1:
-                result = self._check_curated_kb(command)
-                if not result:
-                    return f"'{command}' not found in curated KB at `{self.valves.CURATED_KB_PATH}`"
-            elif source_int == 2:
-                result = self._check_man_page(command, "")
-                if not result:
-                    return f"Man page not found for '{command}' (is man installed?)"
-            else:
-                result = self._fetch_online_docs(command)
-                if not result:
-                    return f"No online documentation found for '{command}'"
+            if not result:
+                return (
+                    f"No documentation found for '{command}' ({lang}) "
+                    f"from source {source_int} ({source_names.get(str(source_int), '?')})"
+                )
 
             result["trust_level"] = trust_levels.get(result.get("source", "unknown"), 0.0)
             was_updated = self._update_cache_with_authority(cache, command, result)
 
             if was_updated:
-                self._save_command_cache(cache)
+                self._save_lang_cache(lang, cache)
                 self._recently_learned.append(command)
                 msg = (
                     f"✓ Learned '{command}' from {result['source']} "
-                    f"(trust={result['trust_level']:.1f})\n\n"
+                    f"(lang={lang}, trust={result['trust_level']:.1f})\n\n"
                     f"**Valid flags:** {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
                     f"**Valid subcommands:** {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}\n"
                 )
                 batch_active = self._batch_mode if self._batch_mode is not None else self.valves.BATCH_LEARN_MODE
                 if self.valves.AUTO_REVALIDATE_AFTER_LEARN and not batch_active:
-                    user_id = (__user__ or {}).get("id", "")
                     msg += "\n[AUTO-REVALIDATE] Scanning current context...\n"
                     code = self._extract_recent_code_from_context(__messages__, user_id)
                     if code and command in code:
                         msg += f"Found '{command}' usage in current code. Validating...\n\n"
-                        issues = self._validate_bash(code, f"post-learn:{command}")
+                        if lang == "bash":
+                            issues = self._validate_bash(code, f"post-learn:{command}")
+                        elif lang == "powershell":
+                            issues = self._validate_powershell(code, f"post-learn:{command}")
+                        else:
+                            issues = []
                         if issues:
                             msg += "⚠️ **VALIDATION ISSUES FOUND:**\n"
                             for issue in issues:
@@ -2374,18 +2545,25 @@ Output format:
         if action == "-d":
             if not command:
                 return "Error: command name required for -d"
-            cache = self._load_command_cache()
+            user_id = (__user__ or {}).get("id", "")
+            lang = _resolve_lang(lang, __messages__, user_id)
+            cache = self._load_lang_cache(lang)
             if command not in cache:
-                return f"'{command}' not in cache"
+                return f"'{command}' not in {lang} cache"
             old = cache.pop(command)
-            self._save_command_cache(cache)
-            return f"Deleted '{command}' (was from {old.get('source', 'unknown')}, trust={old.get('trust_level', 0.0):.1f})"
+            self._save_lang_cache(lang, cache)
+            return (
+                f"Deleted '{command}' from {lang} cache "
+                f"(was from {old.get('source', 'unknown')}, trust={old.get('trust_level', 0.0):.1f})"
+            )
 
         # -r: refresh command knowledge, optionally from a specific source or URL
         if action == "-r":
             if not command:
                 return "Error: command name required for -r"
-            cache = self._load_command_cache()
+            user_id = (__user__ or {}).get("id", "")
+            lang = _resolve_lang(lang, __messages__, user_id)
+            cache = self._load_lang_cache(lang)
 
             if url:
                 result = self._fetch_from_url(command, url)
@@ -2398,85 +2576,94 @@ Output format:
                 try:
                     source_int = int(source)
                 except (ValueError, TypeError):
-                    return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages, 3=online_docs"
-                if source_int == 1:
-                    result = self._check_curated_kb(command)
-                elif source_int == 2:
-                    result = self._check_man_page(command, "")
-                elif source_int == 3:
-                    result = self._fetch_online_docs(command)
-                else:
-                    return f"Error: source must be 1, 2, or 3 (got {source_int})"
+                    return f"Error: invalid source '{source}'. Use 1=curated_kb, 2=man_pages/local_help, 3=online_docs"
+                result = self._get_knowledge_for_command(command, lang, source_int)
                 if not result:
                     return f"No documentation found for '{command}' from source {source_int} ({source_names.get(str(source_int), '?')})"
             else:
                 # Auto: walk tiers
                 result = (
-                    self._check_curated_kb(command)
-                    or self._check_man_page(command, "")
-                    or self._fetch_online_docs(command)
+                    self._get_knowledge_for_command(command, lang, 1)
+                    or self._get_knowledge_for_command(command, lang, 2)
+                    or self._get_knowledge_for_command(command, lang, 3)
                 )
                 if not result:
-                    return f"No documentation found for '{command}' from any source"
+                    return f"No documentation found for '{command}' ({lang}) from any source"
 
             result.setdefault("trust_level", trust_levels.get(result.get("source", "unknown"), 0.0))
             # Force-replace regardless of existing trust
             cache[command] = result
-            self._save_command_cache(cache)
+            self._save_lang_cache(lang, cache)
             return (
-                f"Refreshed '{command}' from {result['source']} "
+                f"Refreshed '{command}' ({lang}) from {result['source']} "
                 f"(trust={result['trust_level']:.1f})\n"
                 f"Valid flags: {', '.join(result.get('valid_flags', [])) or 'none recorded'}\n"
                 f"Valid subcommands: {', '.join(result.get('valid_subcommands', [])) or 'none recorded'}"
             )
 
-        # -s: show cache statistics
+        # -s: show cache statistics for all language caches
         if action == "-s":
-            cache = self._load_command_cache()
-            total = len(cache)
-            if total == 0:
+            import glob as _glob
+            cache_dir = os.path.join(
+                self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+            )
+            if not os.path.isdir(cache_dir):
+                return "Cache directory not found. Run `skillstack -init`."
+            cache_files = sorted(_glob.glob(os.path.join(cache_dir, "command_knowledge*.json")))
+            if not cache_files:
                 return "Cache is empty. Use `skillstack -l <command> <source>` to populate it."
-
-            by_source: dict = {}
-            by_trust = {"high (>=0.9)": 0, "medium (0.7-0.9)": 0, "low (<0.7)": 0}
-            for data in cache.values():
-                src = data.get("source", "unknown")
-                by_source[src] = by_source.get(src, 0) + 1
-                trust = data.get("trust_level", 0.0)
-                if trust >= 0.9:
-                    by_trust["high (>=0.9)"] += 1
-                elif trust >= 0.7:
-                    by_trust["medium (0.7-0.9)"] += 1
-                else:
-                    by_trust["low (<0.7)"] += 1
-
-            lines = [
-                f"## Command Knowledge Cache\n",
-                f"**Total commands:** {total}\n",
-                f"**Cache path:** `{self._get_command_cache_path()}`\n",
-                f"\n**By source:**",
-            ]
-            for src, count in sorted(by_source.items(), key=lambda x: -x[1]):
-                lines.append(f"  {src}: {count}")
-            lines.append("\n**By trust level:**")
-            for level, count in by_trust.items():
-                lines.append(f"  {level}: {count}")
-            lines.append(f"\n**Commands:** {', '.join(sorted(cache.keys()))}")
+            lines = ["## Command Knowledge Cache\n"]
+            for cache_file in cache_files:
+                fname = os.path.basename(cache_file)
+                lang_label = "bash" if fname == "command_knowledge.json" else \
+                    fname.replace("command_knowledge_", "").replace(".json", "")
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        _cache = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    lines.append(f"### {lang_label}: corrupted\n")
+                    continue
+                total = len(_cache)
+                if total == 0:
+                    lines.append(f"### {lang_label}: empty\n")
+                    continue
+                by_source: dict = {}
+                by_trust = {"high (>=0.9)": 0, "medium (0.7-0.9)": 0, "low (<0.7)": 0}
+                for data in _cache.values():
+                    src = data.get("source", "unknown")
+                    by_source[src] = by_source.get(src, 0) + 1
+                    trust = data.get("trust_level", 0.0)
+                    if trust >= 0.9:
+                        by_trust["high (>=0.9)"] += 1
+                    elif trust >= 0.7:
+                        by_trust["medium (0.7-0.9)"] += 1
+                    else:
+                        by_trust["low (<0.7)"] += 1
+                lines.append(f"### {lang_label}: {total} commands\n")
+                for src, count in sorted(by_source.items(), key=lambda x: -x[1]):
+                    lines.append(f"  by source — {src}: {count}")
+                for level, count in by_trust.items():
+                    if count:
+                        lines.append(f"  {level}: {count}")
+                lines.append(f"  commands: {', '.join(sorted(_cache.keys()))}")
+                lines.append("")
             return "\n".join(lines)
 
         # -i: inspect a specific command
         if action == "-i":
             if not command:
                 return "Error: command name required for -i"
-            cache = self._load_command_cache()
+            user_id = (__user__ or {}).get("id", "")
+            lang = _resolve_lang(lang, __messages__, user_id)
+            cache = self._load_lang_cache(lang)
             if command not in cache:
                 return (
-                    f"No cached data for '{command}'. "
-                    f"Use `skillstack -l {command} 2` to learn from man pages."
+                    f"No cached data for '{command}' in {lang} cache. "
+                    f"Use `skillstack -l {command} 2` to learn from man pages/local help."
                 )
             data = cache[command]
             lines = [
-                f"## {command}\n",
+                f"## {command} ({lang})\n",
                 f"**Source:** {data.get('source', 'unknown')}  "
                 f"**Trust:** {data.get('trust_level', 0.0):.1f}  "
                 f"**Cached:** {data.get('cached_at', 'unknown')}\n",
@@ -2710,6 +2897,7 @@ Output format:
 
         # -health: check cache integrity and report status
         if action == "-health":
+            import glob as _glob
             # Auto-repair before reporting so first-run always shows green
             self._ensure_cache_exists()
 
@@ -2717,7 +2905,6 @@ Output format:
                 self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
             )
             curated_path = os.path.join(cache_dir, "curated_kb.json")
-            cache_path = os.path.join(cache_dir, "command_knowledge.json")
             status = []
 
             if os.path.isdir(cache_dir):
@@ -2751,15 +2938,21 @@ Output format:
             else:
                 status.append("✗ Curated KB could not be read — run `skillstack -init`")
 
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        cache = json.load(f)
-                    status.append(f"✓ Learned cache: {len(cache)} commands")
-                except (json.JSONDecodeError, OSError):
-                    status.append("✗ Learned cache corrupted — run `skillstack -init` to reset")
+            # Dynamically check all command_knowledge*.json files
+            cache_files = sorted(_glob.glob(os.path.join(cache_dir, "command_knowledge*.json")))
+            if not cache_files:
+                status.append("✗ No knowledge cache files found — run `skillstack -init`")
             else:
-                status.append("✗ Learned cache missing — run `skillstack -init`")
+                for cache_file in cache_files:
+                    fname = os.path.basename(cache_file)
+                    lang_label = "bash" if fname == "command_knowledge.json" else \
+                        fname.replace("command_knowledge_", "").replace(".json", "")
+                    try:
+                        with open(cache_file, "r", encoding="utf-8") as f:
+                            _c = json.load(f)
+                        status.append(f"✓ {lang_label} cache: {len(_c)} commands")
+                    except (json.JSONDecodeError, OSError):
+                        status.append(f"✗ {lang_label} cache corrupted — run `skillstack -init` to reset")
 
             return "\n".join(status)
 
@@ -2785,21 +2978,57 @@ Output format:
             return "\n".join(lines)
 
         if action == "-dump":
-            cache = self._load_command_cache()
-            if not cache:
-                return "Cache is empty."
-            if command:
-                if command not in cache:
+            import glob as _glob
+            cache_dir = os.path.join(
+                self.valves.STORAGE_BASE_PATH, "superpowers", "validation_cache"
+            )
+            if lang:
+                _cache = self._load_lang_cache(lang)
+                if not _cache:
+                    return f"{lang} cache is empty."
+                if command:
+                    if command not in _cache:
+                        return f"'{command}' not in {lang} cache."
+                    return f"```json\n{json.dumps({command: _cache[command]}, indent=2)}\n```"
+                return f"```json\n{json.dumps(_cache, indent=2)}\n```"
+            elif command:
+                # No lang specified — check bash cache (backward compat)
+                _cache = self._load_command_cache()
+                if command not in _cache:
                     return f"'{command}' not in cache."
-                data = {command: cache[command]}
+                return f"```json\n{json.dumps({command: _cache[command]}, indent=2)}\n```"
             else:
-                data = cache
-            return f"```json\n{json.dumps(data, indent=2)}\n```"
+                # No lang, no command — dump all caches grouped by language
+                if not os.path.isdir(cache_dir):
+                    return "Cache is empty."
+                cache_files = sorted(_glob.glob(os.path.join(cache_dir, "command_knowledge*.json")))
+                if not cache_files:
+                    return "Cache is empty."
+                parts = []
+                for cache_file in cache_files:
+                    fname = os.path.basename(cache_file)
+                    lang_label = "bash" if fname == "command_knowledge.json" else \
+                        fname.replace("command_knowledge_", "").replace(".json", "")
+                    try:
+                        with open(cache_file, "r", encoding="utf-8") as f:
+                            _c = json.load(f)
+                        if _c:
+                            parts.append(f"// {lang_label}\n{json.dumps(_c, indent=2)}")
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                if not parts:
+                    return "Cache is empty."
+                return "```json\n" + "\n\n".join(parts) + "\n```"
 
         return (
             f"Unknown action '{action}'. Valid actions:\n"
             f"  -l (learn)      -d (delete)   -r (refresh)    -s (stats)\n"
             f"  -i (inspect)    -export       -import         -audit\n"
             f"  -validate       -revalidate   -batch on/off   -health\n"
-            f"  -init           -dump               dump cache contents as JSON (optional: -dump <command>)"
+            f"  -init           -dump\n"
+            f"\n"
+            f"  All of -l/-d/-r/-i/-dump accept an optional lang= parameter.\n"
+            f"  If lang omitted, it is auto-detected from recent conversation.\n"
+            f"  Example: skillstack -l Get-Service 2 powershell\n"
+            f"           skillstack -dump bash"
         )
