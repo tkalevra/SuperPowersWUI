@@ -1903,6 +1903,18 @@ Output format:
         )
         return path
 
+    def _extract_code_blocks_only(self, content: str) -> str:
+        blocks = re.findall(
+            r"(```[\w]*\n.*?```)",
+            content,
+            re.DOTALL
+        )
+        commit_match = re.search(r"^COMMIT:.*$", content, re.MULTILINE)
+        parts = blocks[:]
+        if commit_match:
+            parts.append(commit_match.group(0))
+        return "\n\n".join(parts) if parts else content
+
     async def execute_task(
         self,
         plan_path: str,
@@ -2104,10 +2116,11 @@ Output format:
             )
 
         # Validation passed — write to scratch only now
+        scratch_content = self._extract_code_blocks_only(combined_result)
         if task_number == 1:
             ok, err = self._atomic_write(
                 scratch_path,
-                f"# {feature_name} — Scratch Build\n\n## Task 1\n\n{combined_result}\n\n"
+                f"# {feature_name} — Scratch Build\n\n## Task 1\n\n{scratch_content}\n\n"
             )
             if not ok:
                 return (
@@ -2129,7 +2142,7 @@ Output format:
                     )
             ok, err = self._atomic_write(
                 scratch_path,
-                existing + f"## Task {task_number}\n\n{combined_result}\n\n"
+                existing + f"## Task {task_number}\n\n{scratch_content}\n\n"
             )
             if not ok:
                 return (
