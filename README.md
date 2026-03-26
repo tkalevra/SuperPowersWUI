@@ -1,139 +1,157 @@
-# superpowers-owui
+# SuperPowersWUI
 
-Open WebUI Tool port of [Superpowers](https://github.com/obra/superpowers) by Jesse Vincent.
+A structured agentic development workflow for [Open WebUI](https://github.com/open-webui/open-webui) — 
+works with any local or remote LLM via any OpenAI-compatible endpoint.
 
-Brings the brainstorm → spec → plan → execute agentic development workflow
-to any Open WebUI installation using any OpenAI-compatible local or remote LLM.
+Instead of asking your LLM to "write me a script" and hoping for the best, SuperPowersWUI 
+walks it through a proper development process: brainstorm the design, write a reviewed spec, 
+generate a TDD implementation plan, then execute task by task. Each phase is reviewed by a 
+sub-agent before moving forward. You stay in control of the pace.
+```
+brainstorm → spec → review → plan → review → execute
+```
 
-## Credits
-
-This tool is a port of [Superpowers](https://github.com/obra/superpowers) by
-[Jesse Vincent (obra)](https://github.com/obra), used under MIT license.
-
-The methodology, skill content, and workflow design are obra's work.
-This port adapts them for the Open WebUI ecosystem.
+> **Based on [Superpowers](https://github.com/obra/superpowers) by [Jesse Vincent (obra)](https://github.com/obra)** — MIT License  
+> The methodology, workflow design, and skill content are obra's work. This tool ports 
+> that workflow into Open WebUI so it runs against local and remote LLMs without requiring 
+> Claude Code. If this has been useful to you, consider [sponsoring obra](https://github.com/sponsors/obra).
 
 ---
 
-## Credits & Acknowledgements
+## What it does
 
-**[Superpowers](https://github.com/obra/superpowers)** by Jesse Vincent (obra) — MIT License
-The methodology, skill content, and workflow design this tool is based on.
-If this tool has been useful to you, consider [sponsoring obra](https://github.com/sponsors/obra).
+You describe what you want to build. The workflow takes it from there:
 
-**[Fileshed](https://github.com/Fade78/Fileshed)** by Fade78 — MIT License
-Recommended companion tool providing persistent file storage for Open WebUI.
-The default storage path in this tool is compatible with Fileshed's workspace
-layout. Install Fileshed alongside this tool for the best experience — specs
-and plans will appear in your Fileshed Storage workspace automatically.
+1. **Brainstorm** — clarifies the design before any code is written
+2. **Spec** — writes a structured requirement document, then runs an automated reviewer against it
+3. **Plan** — generates a task-by-task TDD implementation plan, reviewed before execution
+4. **Execute** — injects each task with full TDD context; you control the pace, one task at a time
+
+Each phase produces a saved document (spec, plan, scratch build log) that persists across 
+conversations when used with [Fileshed](https://github.com/Fade78/Fileshed).
+
+---
+
+## Requirements
+
+- [Open WebUI](https://github.com/open-webui/open-webui) 0.4.0+
+- Any OpenAI-compatible LLM endpoint (LM Studio, Ollama, or remote API)
+- Native Function Calling enabled on your model
 
 ---
 
 ## Installation
 
-1. In Open WebUI, go to **Settings → Tools → Add Tool**
+1. In Open WebUI, go to **Workspace → Tools → Add Tool**
 2. Paste the contents of `superpowers_tool.py`
-3. Configure Valves:
-   - `LLM_BASE_URL`: your endpoint (default: `http://localhost:1234/v1` for LM Studio)
-   - `MODEL_NAME`: your model identifier (e.g. `lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF`)
-   - `API_KEY`: `lm-studio` for LM Studio, `ollama` for Ollama, or your real key for remote
-4. Enable the tool in your model's settings
+3. Enable the tool on your model
+
+That's it. The tool works out of the box with default valves pointing to LM Studio 
+on `localhost:1234`. Adjust the valves if your setup differs.
 
 ### Fileshed Integration (Recommended)
 
-For persistent spec and plan files that survive across conversations,
-install [Fileshed](https://github.com/Fade78/Fileshed) alongside this tool.
+[Fileshed](https://github.com/Fade78/Fileshed) by [Fade78](https://github.com/Fade78) 
+is a companion Open WebUI tool that gives you a persistent file workspace. With it 
+installed, your specs and plans survive across conversations and are browsable in the 
+Fileshed Storage zone.
 
 **Setup:**
-1. Install Fileshed in Open WebUI (Workspace → Tools → Add Tool)
-2. Ensure both tools have matching `storage_base_path` / `STORAGE_BASE_PATH`
-   valve values (default: `/app/backend/data/user_files`)
-3. Enable `FILESHED_COMPATIBLE: True` in SuperPowersWUI valves (default)
-4. Enable Native Function Calling on your model for both tools
 
-**What you get:**
-- Specs appear in Fileshed Storage zone under `superpowers/specs/`
-- Plans appear in Fileshed Storage zone under `superpowers/plans/`
-- Use `shed_exec` to read, edit, or share specs and plans
-- Files persist across conversations
+1. Install Fileshed in Open WebUI alongside this tool
+2. Make sure both tools have matching `STORAGE_BASE_PATH` valve values  
+   (default: `/app/backend/data/user_files`)
+3. `FILESHED_COMPATIBLE` is `True` by default — no changes needed
 
-**Without Fileshed:**
-Set `FILESHED_COMPATIBLE: False`. Files write to
-`{STORAGE_BASE_PATH}/superpowers/` but require filesystem access to retrieve.
-The tool remains fully functional for brainstorming, reviewing, and plan
-generation — only file persistence across conversations is affected.
+**Without Fileshed:** set `FILESHED_COMPATIBLE: False`. Files still write to disk 
+but require direct filesystem access to retrieve. All workflow functionality remains intact.
 
-**Requirements note:**
-Both tools require Native Function Calling enabled on your model.
-Fileshed requires Open WebUI 0.4.0+.
+---
 
-## Workflow
+## Usage
+
+Start a conversation with your model and use natural language:
 
 | Say this | What happens |
-|----------|--------------|
-| `brainstorm <idea>` | Starts brainstorming phase — one question at a time |
-| `write the spec` | Saves spec document + runs automated reviewer |
-| `write the plan` | Generates TDD implementation plan + runs automated reviewer |
-| `execute task 1` | Injects TDD context for task 1, you control pacing |
+|---|---|
+| `brainstorm <your idea>` | Kicks off the design phase |
+| `cook` | Runs the workflow autonomously to completion |
+| `ask` | Pauses at each phase for your approval before continuing |
+| `write the spec` | Saves the agreed design as a spec document |
+| `write the plan` | Generates a TDD implementation plan from the spec |
+| `execute task 1` | Runs task 1 — call again with `task 2`, `task 3`, etc. |
+
+Switch between `cook` and `ask` mode at any time during a session.
 
 ### Phase markers
 
-Every function embeds a `[SUPERPOWERS:PHASE:X]` tag in its output. These allow the
-model (and you) to track where you are in the workflow:
+The tool embeds phase markers in its output so you always know where you are:
 
 | Marker | Meaning |
-|--------|---------|
-| `[SUPERPOWERS:PHASE:BRAINSTORMING]` | Clarifying questions in progress |
+|---|---|
 | `[SUPERPOWERS:PHASE:SPEC_REVIEW]` | Spec written, reviewer running |
 | `[SUPERPOWERS:PHASE:PLAN_REVIEW]` | Plan written, reviewer running |
 | `[SUPERPOWERS:PHASE:READY]` | Plan approved, ready to execute |
 | `[SUPERPOWERS:PHASE:EXECUTING:TASK_N]` | Executing task N |
+| `[SUPERPOWERS:TASK:COMPLETE]` | Task done, waiting for your call to continue |
 
-## Stack Compatibility
-
-Tested with:
-- LM Studio (default config, `http://localhost:1234/v1`)
-- Ollama (`http://localhost:11434/v1`)
-- Any OpenAI-compatible endpoint
+---
 
 ## Valves Reference
 
 | Valve | Default | Description |
-|-------|---------|-------------|
-| `LLM_BASE_URL` | `http://localhost:1234/v1` | Your OpenAI-compatible endpoint |
-| `MODEL_NAME` | _(empty)_ | Model identifier. Empty = endpoint default |
-| `REVIEWER_MODEL` | _(empty)_ | Separate model for reviewer passes. Falls back to MODEL_NAME |
-| `SPEC_DIR` | `docs/superpowers/specs` | Where spec files are saved |
-| `PLAN_DIR` | `docs/superpowers/plans` | Where plan files are saved |
-| `API_KEY` | `lm-studio` | Auth key for your endpoint |
+|---|---|---|
+| `STORAGE_BASE_PATH` | `/app/backend/data/user_files` | Base path for specs, plans, and scratch files |
+| `FILESHED_COMPATIBLE` | `True` | Write files to Fileshed-compatible paths |
+| `COMPLEXITY` | `simple` | Controls spec/plan verbosity: `simple`, `medium`, `complex` |
+| `SPEC_DIR` | `specs` | Subdirectory under superpowers/ for spec files |
+| `PLAN_DIR` | `plans` | Subdirectory under superpowers/ for plan files |
+| `ENABLE_SHELLCHECK` | `True` | Run shellcheck on bash code blocks during validation |
+| `ENABLE_ESLINT` | `False` | Run eslint on JS/TS code blocks during validation |
+| `VALIDATION_TIMEOUT` | `5` | Timeout in seconds for external validator calls |
 
-## How the reviewer simulation works
+---
 
-When `write_spec` or `write_plan` completes, the tool makes a **second isolated HTTP
-completion call** to your endpoint — no conversation history, no chat context. Just the
-document content and a reviewer system prompt. This approximates Superpowers' subagent
-review loops without requiring native subagent support in Open WebUI.
+## SkillStack — Command Validation Cache
 
-Set `REVIEWER_MODEL` to a different (faster/cheaper) model to keep reviewer passes quick.
+SuperPowersWUI includes a built-in command knowledge cache that validates generated 
+code before writing it to the scratch file. It checks flags, subcommands, and known 
+bad patterns against a curated knowledge base, with fallback to man pages and online docs.
 
-## Agent-Driven Mode (optional)
+Manage it during a session with the `skillstack` tool function:
 
-Add this to your model's system prompt to enable automatic workflow triggering without
-explicit tool invocations:
+| Command | What it does |
+|---|---|
+| `skillstack -l sftp 2` | Learn sftp from man pages |
+| `skillstack -l Get-NetFirewallRule 2 powershell` | Learn a PowerShell cmdlet |
+| `skillstack -i sftp` | Inspect cached knowledge for a command |
+| `skillstack -s` | Show cache statistics |
+| `skillstack -dump` | Dump full cache as JSON |
+| `skillstack -dump sftp` | Dump a single command's cache entry |
+| `skillstack -health` | Check cache file integrity |
+| `skillstack -validate` | Validate code from the current conversation |
 
-```
-When the user wants to build something, automatically invoke the superpowers brainstorm tool.
-When brainstorming is complete and the user approves the design, invoke superpowers write_spec.
-When the spec is approved, invoke superpowers write_plan.
-When executing, invoke superpowers execute_task for each task individually.
-Always follow the phase markers [SUPERPOWERS:PHASE:X] to track workflow state.
-```
+---
 
 ## File Output
 
-Spec and plan documents are saved with datestamped filenames under the configured `STORAGE_BASE_PATH`:
-- Specs: `{STORAGE_BASE_PATH}/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
-- Plans: `{STORAGE_BASE_PATH}/superpowers/plans/YYYY-MM-DD-<feature>.md`
+| File type | Path |
+|---|---|
+| Specs | `superpowers/specs/YYYY-MM-DD-<topic>-design.md` |
+| Plans | `superpowers/plans/YYYY-MM-DD-<feature>.md` |
+| Scratch | `superpowers/scratch/<feature>.scratch` |
 
-Directories are created automatically. Default base path is `/app/backend/data/user_files` (Open WebUI's internal storage).
-If [Fileshed](https://github.com/Fade78/Fileshed) is installed, set `STORAGE_BASE_PATH` to match Fileshed's `storage_base_path` valve and files will appear in your Fileshed Storage workspace automatically.
+All paths are relative to `STORAGE_BASE_PATH`. Directories are created automatically.
+
+---
+
+## Credits
+
+**[Superpowers](https://github.com/obra/superpowers)** — [Jesse Vincent (obra)](https://github.com/obra) — MIT License  
+The methodology, workflow design, and skill content this tool is built on.
+
+**[Fileshed](https://github.com/Fade78/Fileshed)** — [Fade78](https://github.com/Fade78) — MIT License  
+Recommended companion tool for persistent file storage in Open WebUI.
+
+**SuperPowersWUI** — [Chris Thompson (tkalevra)](https://github.com/tkalevra) — MIT License  
+This port. Independently developed, not officially affiliated with either upstream project.
