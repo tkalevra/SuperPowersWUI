@@ -130,6 +130,15 @@ class Tools:
                 "included in the SuperpowersWUI repo under bash-validation/."
             ),
         )
+        AUTO_VALIDATE_BASH: bool = Field(
+            default=False,
+            description=(
+                "When True, spec and plan generation automatically scan output for "
+                "bash/shell code blocks and append any validation issues inline. "
+                "Uses the same persistent cross-conversation cache as analyze_code. "
+                "Set True to catch bad flags or invalid subcommands before they reach execute_task."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -138,6 +147,7 @@ class Tools:
         self._recently_learned: list = []
         self._batch_mode: bool = None  # None = use valve; True/False = runtime override
         self._ensure_cache_exists()
+        self._ensure_docker_folders()
 
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
         if self.valves.FILESHED_COMPATIBLE and user_id:
@@ -243,7 +253,7 @@ class Tools:
     # Tool functions
     # -------------------------------------------------------------------------
 
-    async def brainstorm(
+    async def spwui_brainstorm(
         self,
         idea: str,
         __user__: dict = None,
@@ -335,7 +345,7 @@ class Tools:
             return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input.\n" + mode_tag
         return result + "\n\n" + mode_tag
 
-    async def start_spec(
+    async def spwui_start_spec(
         self,
         topic_and_summary: str,
         __user__: dict = None,
@@ -365,14 +375,14 @@ class Tools:
         parts = topic_and_summary.split("|||", 1)
         topic = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else topic
-        return await self.write_spec(
+        return await self.spwui_write_spec(
             topic, summary,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
             __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
 
-    async def write_spec(
+    async def spwui_write_spec(
         self,
         topic: str,
         design_summary: str,
@@ -552,6 +562,21 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
 
+        # AUTO_VALIDATE_BASH: scan generated spec for bash code blocks and report issues inline
+        auto_validate_note = ""
+        if self.valves.AUTO_VALIDATE_BASH:
+            bash_blocks = re.findall(r"```(?:bash|sh|shell)\n(.*?)```", cleaned, re.DOTALL)
+            all_issues = []
+            for i, block in enumerate(bash_blocks, 1):
+                issues = self._validate_bash(block, f"spec-block-{i}")
+                all_issues.extend(issues)
+            if all_issues:
+                auto_validate_note = (
+                    "\n\n### Bash Validation Issues (AUTO_VALIDATE_BASH)\n\n"
+                    + "\n".join(f"- {iss}" for iss in all_issues)
+                    + "\n\nFix these before proceeding to plan."
+                )
+
         if self.valves.COMPLEXITY == "simple" and self._get_mode(__messages__) == "cook":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
@@ -559,7 +584,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"[SUPERPOWERS:PHASE:SPEC_DONE]\n\n"
                 f"**Spec saved:** `{spec_path}`\n"
                 f"**Mode:** simple — skipping review, proceeding to plan.\n\n"
-                f"[SUPERPOWERS:AUTO-CONTINUE]"
+                + auto_validate_note
+                + f"\n[SUPERPOWERS:AUTO-CONTINUE]"
             )
 
         if self._get_mode(__messages__) == "ask":
@@ -569,7 +595,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"[SUPERPOWERS:PHASE:SPEC_REVIEW]\n\n"
                 f"**Spec saved:** `{spec_path}`\n"
                 f"**Storage:** {storage_label}\n\n"
-                f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Spec written. Reply **cook** to continue to review, or give feedback to revise."
+                + auto_validate_note
+                + f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Spec written. Reply **cook** to continue to review, or give feedback to revise."
                 f"\n[SUPERPOWERS:MODE:ASK]"
             )
 
@@ -580,18 +607,20 @@ Output ONLY the markdown document. No preamble, no commentary."""
             f"**Storage:** {storage_label}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
-        review_result = await self.review_spec(
+        review_result = await self.spwui_review_spec(
             spec_path,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
             __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
         output += review_result
+        if auto_validate_note:
+            output += auto_validate_note
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output + "\n[SUPERPOWERS:MODE:COOK]"
 
-    async def review_spec(
+    async def spwui_review_spec(
         self,
         spec_path: str,
         __user__: dict = None,
@@ -610,7 +639,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         Args:
             spec_path: Path to the spec markdown file to review.
 
-        If the spec or plan contains code samples, call analyze_code on them
+        If the spec or plan contains code samples, call spwui_validate_code on them
         before returning your verdict.
 
         After this tool returns, immediately call the next tool in the
@@ -708,8 +737,8 @@ Output format:
                 return (
                     f"{review}\n\n"
                     f"---\n\n"
-                    f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
-                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call review_spec again."
+                    f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `spwui_review_spec` again. Fix only what is listed — do not attempt to fix anything else."
+                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Address them, then call spwui_review_spec again."
                     f"\n[SUPERPOWERS:MODE:ASK]"
                 )
 
@@ -732,12 +761,12 @@ Output format:
             return (
                 f"{review}\n\n"
                 f"---\n\n"
-                f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `review_spec` again. Fix only what is listed — do not attempt to fix anything else."
+                f"**Issues found in spec.** Address the blocking issues above (maximum two), then call `spwui_review_spec` again. Fix only what is listed — do not attempt to fix anything else."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
                 f"\n[SUPERPOWERS:MODE:COOK]"
             )
 
-    async def write_plan(
+    async def spwui_write_plan(
         self,
         spec_path: str,
         feature_name: str,
@@ -938,6 +967,21 @@ Output ONLY the markdown document. No preamble, no commentary."""
 
         storage_label = "Fileshed Storage zone (superpowers/)" if storage_mode == "fileshed" else "Standalone path"
 
+        # AUTO_VALIDATE_BASH: scan generated plan for bash code blocks and report issues inline
+        auto_validate_note = ""
+        if self.valves.AUTO_VALIDATE_BASH:
+            bash_blocks = re.findall(r"```(?:bash|sh|shell)\n(.*?)```", cleaned, re.DOTALL)
+            all_issues = []
+            for i, block in enumerate(bash_blocks, 1):
+                issues = self._validate_bash(block, f"plan-block-{i}")
+                all_issues.extend(issues)
+            if all_issues:
+                auto_validate_note = (
+                    "\n\n### Bash Validation Issues (AUTO_VALIDATE_BASH)\n\n"
+                    + "\n".join(f"- {iss}" for iss in all_issues)
+                    + "\n\nFix these before proceeding to spwui_execute_task."
+                )
+
         if self.valves.COMPLEXITY == "simple" and self._get_mode(__messages__) == "cook":
             if __event_emitter__:
                 await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
@@ -945,7 +989,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"[SUPERPOWERS:PHASE:PLAN_DONE]\n\n"
                 f"**Plan saved:** `{plan_path}`\n"
                 f"**Mode:** simple — skipping review, proceeding to execute task 1.\n\n"
-                f"[SUPERPOWERS:AUTO-CONTINUE]"
+                + auto_validate_note
+                + f"\n[SUPERPOWERS:AUTO-CONTINUE]"
             )
 
         if self._get_mode(__messages__) == "ask":
@@ -955,7 +1000,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
                 f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                 f"**Plan saved:** `{plan_path}`\n"
                 f"**Storage:** {storage_label}\n\n"
-                f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Plan written. Reply **cook** to continue to review, or give feedback to revise."
+                + auto_validate_note
+                + f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Plan written. Reply **cook** to continue to review, or give feedback to revise."
                 f"\n[SUPERPOWERS:MODE:ASK]"
             )
 
@@ -966,18 +1012,20 @@ Output ONLY the markdown document. No preamble, no commentary."""
             f"**Storage:** {storage_label}\n\n"
             f"Running automated reviewer...\n\n---\n\n"
         )
-        review_result = await self.review_plan(
+        review_result = await self.spwui_review_plan(
             plan_path,
             __user__=__user__, __metadata__=__metadata__, __event_emitter__=__event_emitter__,
             __request__=__request__, __model__=__model__, __event_call__=__event_call__,
             __chat_id__=__chat_id__, __message_id__=__message_id__, __messages__=__messages__,
         )
         output += review_result
+        if auto_validate_note:
+            output += auto_validate_note
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Done.", "done": True}})
         return output + "\n[SUPERPOWERS:MODE:COOK]"
 
-    async def review_plan(
+    async def spwui_review_plan(
         self,
         plan_path: str,
         __user__: dict = None,
@@ -996,7 +1044,7 @@ Output ONLY the markdown document. No preamble, no commentary."""
         Args:
             plan_path: Path to the plan markdown file to review.
 
-        If the spec or plan contains code samples, call analyze_code on them
+        If the spec or plan contains code samples, call spwui_validate_code on them
         before returning your verdict.
 
         After this tool returns, immediately call the next tool in the
@@ -1131,9 +1179,9 @@ Output format:
                     f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                     f"{review}\n\n"
                     f"---\n\n"
-                    f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
+                    f"**Issues found in plan.** Call `spwui_write_plan` again with the same `spec_path` and `feature_name`,"
                     f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
-                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Call write_plan again with revision_notes."
+                    f"\n\n[SUPERPOWERS:PHASE:COMPLETE] Issues found. Call spwui_write_plan again with revision_notes."
                     f"\n[SUPERPOWERS:MODE:ASK]"
                 )
 
@@ -1159,7 +1207,7 @@ Output format:
                 f"[SUPERPOWERS:PHASE:PLAN_REVIEW]\n\n"
                 f"{review}\n\n"
                 f"---\n\n"
-                f"**Issues found in plan.** Call `write_plan` again with the same `spec_path` and `feature_name`, "
+                f"**Issues found in plan.** Call `spwui_write_plan` again with the same `spec_path` and `feature_name`,"
                 f"passing the blocking issues above as `revision_notes`. Do not edit the file directly."
                 f"\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input."
                 f"\n[SUPERPOWERS:MODE:COOK]"
@@ -1274,6 +1322,56 @@ Output format:
             "note": "rsync uses -e for SSH options. Example: rsync -e 'ssh -o StrictHostKeyChecking=yes -i key' src/ user@host:/dst/",
         },
     }
+
+    _DOCKER_SERVICES: dict = {
+        "open-webui": {
+            "container_name": "open-webui",
+            "image": "ghcr.io/open-webui/open-webui:v0.9.2",
+            "ports": ["3000:8080"],
+            "volumes": ["/mnt/data/docker/openwebui:/app/backend/data"],
+            "environment": {
+                "WEBUI_URL": "https://hairbrush.helpdeskpro.ca",
+                "AIOHTTP_CLIENT_TIMEOUT": "300",
+                "VECTOR_DB": "qdrant",
+                "QDRANT_URI": "http://192.168.40.10:6333",
+                "OLLAMA_BASE_URL": "/ollama",
+                "SCARF_NO_ANALYTICS": "true",
+                "DO_NOT_TRACK": "true",
+                "ANONYMIZED_TELEMETRY": "false",
+                "WEBUI_SECRET_KEY": "etvgiugegjffubg",
+                "USE_OLLAMA_DOCKER": "false",
+                "USE_CUDA_DOCKER": "false",
+                "ENABLE_RAG_WEB_SEARCH": "True",
+                "RAG_WEB_SEARCH_ENGINE": "searxng",
+                "SEARXNG_QUERY_URL": "http://192.168.40.10:30053/search?q=<query>",
+                "RAG_WEB_SEARCH_RESULT_COUNT": "5",
+                "RAG_WEB_SEARCH_CONCURRENT_REQUESTS": "10",
+                "WHISPER_MODEL": "base",
+                "WHISPER_MODEL_DIR": "/app/backend/data/cache/whisper/models",
+                "WHISPER_MODEL_AUTO_UPDATE": "false",
+                "HF_HUB_OFFLINE": "1",
+                "ENABLE_WEBSOCKET_SUPPORT": "true",
+            },
+            "extra_hosts": ["host.docker.internal:host-gateway"],
+            "restart": "always",
+            "healthcheck": {
+                "test": ["CMD-SHELL", "curl --silent --fail http://localhost:8080/health | jq -ne 'input.status == true' || exit 1"],
+                "interval": "30s",
+                "timeout": "10s",
+                "retries": 3,
+            },
+        },
+    }
+
+    def _ensure_docker_folders(self) -> None:
+        """Create host-side volume directories for all _DOCKER_SERVICES with group-open permissions."""
+        for service_name, svc in self._DOCKER_SERVICES.items():
+            for vol_spec in svc.get("volumes", []):
+                host_path = vol_spec.split(":")[0]
+                try:
+                    os.makedirs(host_path, mode=0o775, exist_ok=True)
+                except OSError:
+                    pass
 
     def _ensure_cache_exists(self) -> dict:
         """
@@ -1740,13 +1838,13 @@ Output format:
                     source = cmd_info.get("source", "unknown")
                     valid_flags = cmd_info.get("valid_flags", [])
                     if valid_flags:
-                        # Allowlist: flag anything not in the known-good set.
-                        # (?<!-) prevents matching the second char of --long-options.
-                        used_flags = re.findall(r'(?<!-)-([a-zA-Z])', args)
+                        # Allowlist: extract full flag names so -type stays -type,
+                        # not just -t. Matches short (-X) and long (--word, -word).
+                        used_flags = re.findall(r'(?:^|\s)(-{1,2}[a-zA-Z][a-zA-Z0-9_-]*)', args)
                         for flag in used_flags:
-                            if f"-{flag}" not in valid_flags:
+                            if flag not in valid_flags:
                                 issues.append(
-                                    f"{label}: {cmd} -{flag} not in known valid flags (source: {source})"
+                                    f"{label}: {cmd} {flag} not in known valid flags (source: {source})"
                                 )
                     else:
                         # Blocklist fallback for entries that only have invalid_flags
@@ -1770,6 +1868,47 @@ Output format:
                 )
             except Exception:
                 pass  # Non-fatal
+
+        # --- SFTP batch mode: validate subcommands inside heredocs and echo-to-file ---
+        # Catches cases like: echo "PUT $ARCHIVE" >> "$BATCH" where sftp commands
+        # must be lowercase, and the main loop never sees them as direct invocations.
+        sftp_info = cache.get("sftp")
+        if sftp_info and "sftp" in code:
+            valid_sftp_subs = [s.lower() for s in sftp_info.get("valid_subcommands", [])]
+            sftp_source = sftp_info.get("source", "curated_kb")
+            batch_cmds: list = []
+
+            # Heredoc bodies following an sftp invocation: sftp ... << DELIM \n ... \n DELIM
+            for m in re.finditer(
+                r'sftp\b[^\n]*<<-?["\']?(\w+)["\']?\n(.*?)\n\1\b',
+                code, re.DOTALL
+            ):
+                for line in m.group(2).splitlines():
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith('#'):
+                        batch_cmds.append(stripped.split()[0])
+
+            # echo/printf statements that redirect into a file (batch file construction)
+            # Only check >> redirects to avoid flagging regular echo output as sftp commands.
+            for m in re.finditer(r'(?:echo|printf)\s+["\']([^"\']+)["\'].*?>>', code):
+                content = m.group(1).strip()
+                if content:
+                    batch_cmds.append(content.split()[0])
+
+            for subcmd in batch_cmds:
+                subcmd_lower = subcmd.lower()
+                if valid_sftp_subs and subcmd_lower in valid_sftp_subs and subcmd != subcmd_lower:
+                    issues.append(
+                        f"{label}: sftp batch command '{subcmd}' must be lowercase "
+                        f"'{subcmd_lower}' — sftp subcommands are case-sensitive (source: {sftp_source})"
+                    )
+                elif valid_sftp_subs and subcmd_lower not in valid_sftp_subs:
+                    # Only flag bare alphabetic words — skip variables, paths, options
+                    if re.match(r'^[a-zA-Z]{2,}$', subcmd):
+                        issues.append(
+                            f"{label}: sftp batch command '{subcmd}' is not a valid sftp "
+                            f"subcommand (source: {sftp_source})"
+                        )
 
         # --- shellcheck ---
         if self.valves.ENABLE_SHELLCHECK:
@@ -1816,7 +1955,10 @@ Output format:
 
         if re.search(r"\beval\s+", code):
             issues.append(f"{label}: uses eval (security risk and hard to debug)")
-        unquoted = re.findall(r'(?<!["\'])\$\{?\w+\}?(?!["\'])', code)
+        # \{[^}]+\} handles ${VAR} form without backtracking into the closing brace.
+        # [a-zA-Z_]\w* handles plain $VAR form. No trailing lookahead avoids the
+        # truncation bug where $LOG_DIR" was captured as $LOG_DI.
+        unquoted = re.findall(r'(?<!["\'])\$(?:\{[^}]+\}|[a-zA-Z_]\w*)', code)
         if unquoted:
             issues.append(
                 f"{label}: {len(unquoted)} potentially unquoted variable(s) "
@@ -2035,6 +2177,10 @@ Output format:
         import tempfile
         dir_name = os.path.dirname(path)
         try:
+            os.makedirs(dir_name, mode=0o775, exist_ok=True)
+        except OSError as e:
+            return False, str(e)
+        try:
             fd, tmp_path = tempfile.mkstemp(dir=dir_name)
         except OSError as e:
             return False, str(e)
@@ -2072,7 +2218,7 @@ Output format:
             parts.append(commit_match.group(0))
         return "\n\n".join(parts) if parts else content
 
-    async def execute_task(
+    async def spwui_execute_task(
         self,
         plan_path: str,
         task_number: int,
@@ -2357,7 +2503,7 @@ Output format:
         return (
             tdd_context
             + f"\n\n[SUPERPOWERS:TASK:COMPLETE] Task {task_number} done. "
-            + f"Call execute_task with task_number={task_number + 1} when ready, "
+            + f"Call spwui_execute_task with task_number={task_number + 1} when ready, "
             + f"or say 'done' if this was the last task."
             + f"\n[SUPERPOWERS:MODE:{mode.upper()}]"
         )
@@ -2407,7 +2553,71 @@ Output format:
 
         return ""
 
-    async def skillstack(
+    async def spwui_validate_code(
+        self,
+        code: str,
+        language: str = "bash",
+        label: str = "snippet",
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+        __messages__: list = None,
+    ) -> str:
+        """
+        Validate a code snippet against the persistent cross-conversation knowledge cache.
+
+        IMPORTANT — MODELS SHOULD CALL THIS PROACTIVELY:
+          • Call this BEFORE executing any bash/shell script or code block.
+          • Call this whenever you are about to suggest a shell command to the user.
+          • Call this when reviewing specs or plans that contain bash/shell examples.
+          • You do NOT need to be asked — proactive validation prevents broken commands.
+
+        The validation cache (command_knowledge.json) is persistent across all
+        conversations and users. Knowledge learned with `skillstack -l` in one chat
+        is automatically available here in every future chat. This is NOT per-session
+        state — it is a shared, growing knowledge base on disk.
+
+        What this checks:
+          • Invalid or non-existent flags (e.g. sftp -r, find -maxdepths)
+          • Invalid subcommands caught by the curated KB or past learning
+          • Shellcheck warnings (if ENABLE_SHELLCHECK valve is True)
+          • Pattern-based heuristics for common mistakes
+
+        Args:
+            code:     The code snippet to validate (raw string, no fences needed).
+            language: Language of the snippet. Supported: bash, sh, shell, python,
+                      powershell, ps1. Defaults to "bash".
+            label:    Short description used in issue messages (e.g. "task-3-deploy").
+
+        Returns a plain-text report. If no issues are found, returns a short "clean" message.
+        """
+        lang = language.lower().strip()
+        if lang in ("bash", "sh", "shell"):
+            issues = self._validate_bash(code, label)
+        elif lang in ("python", "py"):
+            issues = self._validate_python(code, label, 0)
+        elif lang in ("powershell", "ps1", "pwsh"):
+            issues = self._validate_powershell(code, label)
+        else:
+            issues = self._validate_bash(code, label)
+
+        if not issues:
+            return f"✓ `{label}` ({lang}): No validation issues found. Safe to execute."
+        lines = [f"## Validation issues in `{label}` ({lang})\n"]
+        for issue in issues:
+            lines.append(f"- {issue}")
+        lines.append(
+            "\nFix these issues before executing. "
+            "Use `skillstack -l <command> 2` to update the cache if a flag is valid."
+        )
+        return "\n".join(lines)
+
+    async def spwui_skillstack(
         self,
         action: str,
         command: str = None,
