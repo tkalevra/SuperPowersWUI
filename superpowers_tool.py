@@ -303,7 +303,7 @@ class Tools:
         max_retries: int = 2,
     ) -> str:
         import asyncio
-        from open_webui.utils.chat import generate_chat_completion
+        from open_webui.utils.chat import generate_chat_completion # type: ignore
         from open_webui.models.users import UserModel
 
         _refusal_phrases = [
