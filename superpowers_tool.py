@@ -54,15 +54,13 @@ class Tools:
                 "retrieve. Override for non-Docker installs or custom paths."
             ),
         )
-        FILESHED_COMPATIBLE: bool = Field(
-            default=True,
+        FILESHED_MODE: str = Field(
+            default="auto",
             description=(
-                "Set True if Fileshed is installed alongside this tool (recommended). "
-                "Files will be written to {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/superpowers/ "
-                "and appear automatically in your Fileshed Storage zone. "
-                "Set False for standalone use without Fileshed — files go to "
-                "{STORAGE_BASE_PATH}/superpowers/ instead. "
-                "Both tools must have matching storage_base_path valve values."
+                "Controls Fileshed integration. "
+                "'auto' = detect at runtime, prompt user if missing (recommended). "
+                "'enabled' = force Fileshed paths, skip detection. "
+                "'disabled' = use flat standalone path, no detection or warning."
             ),
         )
         COMPLEXITY: str = Field(
@@ -146,25 +144,97 @@ class Tools:
         self._plan_revision_count = 0
         self._recently_learned: list = []
         self._batch_mode: bool = None  # None = use valve; True/False = runtime override
+        self._fileshed_available: bool = None  # None = not yet probed this session
+        self._fileshed_warned: bool = False
         self._ensure_cache_exists()
         self._ensure_docker_folders()
 
+    def _detect_fileshed(self, user_id: str = "") -> bool:
+        mode = (self.valves.FILESHED_MODE or "auto").lower().strip()
+        if mode == "enabled":
+            self._fileshed_available = True
+            return True
+        if mode == "disabled":
+            self._fileshed_available = False
+            return False
+        if self._fileshed_available is not None:
+            return self._fileshed_available
+        if not user_id:
+            self._fileshed_available = False
+            return False
+        user_dir = os.path.join(self.valves.STORAGE_BASE_PATH, "users", user_id)
+        if not os.path.isdir(user_dir):
+            self._fileshed_available = False
+            return False
+        storage_path = os.path.join(user_dir, "Storage", "data")
+        try:
+            os.makedirs(storage_path, exist_ok=True)
+            probe = os.path.join(storage_path, ".spwui_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.unlink(probe)
+            self._fileshed_available = True
+            return True
+        except OSError:
+            self._fileshed_available = False
+            return False
+
+    def _fileshed_warning_message(self) -> str:
+        return (
+            "⚠️ **Fileshed not detected.**\n\n"
+            "SuperPowersWUI is significantly enhanced by the Fileshed tool "
+            "(https://github.com/Fade78/Fileshed). With it installed, you get:\n\n"
+            "- Per-user isolated file storage\n"
+            "- Project resumability across conversations\n"
+            "- Full `spwui_project_*` workflow with step tracking\n"
+            "- Specs and plans visible in the Fileshed Storage zone\n\n"
+            "Without it, files fall back to a shared flat path with no user isolation "
+            "and no project management features.\n\n"
+            "**To install:** Open WebUI → Workspace → Tools → paste Fileshed.py → Save. "
+            "Then enable it on this model.\n\n"
+            "Would you like to proceed in standalone mode anyway?"
+        )
+
+    async def _require_fileshed_or_confirm(self, user_id: str, __event_emitter__) -> bool:
+        if self._detect_fileshed(user_id):
+            return True
+        if self._fileshed_warned:
+            return True
+        self._fileshed_warned = True
+        if __event_emitter__:
+            await __event_emitter__(
+                {"type": "message", "data": {"content": self._fileshed_warning_message()}}
+            )
+        return False
+
+    def _superpowers_root(self, user_id: str = "") -> str:
+        if self._fileshed_available and user_id:
+            return os.path.join(
+                self.valves.STORAGE_BASE_PATH,
+                "users", user_id, "Storage", "data", "superpowers"
+            )
+        return os.path.join(self.valves.STORAGE_BASE_PATH, "superpowers")
+
+    def _jail_path(self, path: str, user_id: str = "") -> str:
+        root = os.path.realpath(self._superpowers_root(user_id))
+        resolved = os.path.realpath(path)
+        if not resolved.startswith(root):
+            raise ValueError(
+                f"[SUPERPOWERS:PATH_JAIL] Refused: '{path}' resolves to '{resolved}' "
+                f"which is outside superpowers root '{root}'. "
+                f"All file operations must stay within the superpowers directory."
+            )
+        return resolved
+
     def _resolve_path(self, subdir: str, filename: str, user_id: str = "") -> tuple:
-        if self.valves.FILESHED_COMPATIBLE and user_id:
-            base = os.path.join(
-                self.valves.STORAGE_BASE_PATH,
-                "users", user_id, "Storage", "data", "superpowers", subdir
-            )
-            storage_mode = "fileshed"
-        else:
-            base = os.path.join(
-                self.valves.STORAGE_BASE_PATH,
-                "superpowers", subdir
-            )
-            storage_mode = "standalone"
+        root = self._superpowers_root(user_id)
+        base = os.path.join(root, subdir)
         os.makedirs(base, exist_ok=True)
         path = os.path.join(base, filename)
-        zone_relative_path = f"superpowers/{subdir}/{filename}" if storage_mode == "fileshed" else ""
+        storage_mode = "fileshed" if (self._fileshed_available and user_id) else "standalone"
+        zone_relative_path = (
+            f"superpowers/{subdir}/{filename}" if storage_mode == "fileshed" else ""
+        )
         return path, storage_mode, zone_relative_path
 
     def _get_mode(self, messages: list = None) -> str:
@@ -345,6 +415,258 @@ class Tools:
             return result + "\n\n[SUPERPOWERS:AUTO-CONTINUE] Proceed immediately to the next step without waiting for user input.\n" + mode_tag
         return result + "\n\n" + mode_tag
 
+    async def spwui_project_init(
+        self,
+        project_slug: str,
+        step_count: int = 3,
+        description: str = "",
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+        __messages__: list = None,
+    ) -> str:
+        """
+        Initialize a new project under superpowers/projects/<project_slug>/.
+        Creates step folder structure and progress.json. Call before any multi-step work.
+        If Fileshed is not detected, the user is prompted. Calling again proceeds in standalone mode.
+
+        HARD CONSTRAINT: All project output files MUST be written under:
+          superpowers/projects/<project_slug>/stepN/
+        Never write project files to specs/, plans/, scratch/, or outside this tree.
+        Do not move outputs after a step completes.
+
+        Args:
+            project_slug: lowercase-with-hyphens identifier (e.g. 'bidisync-v2').
+            step_count:   Steps to scaffold (default 3, max 10).
+            description:  One-line project description.
+        """
+        user_id = (__user__ or {}).get("id", "")
+        ready = await self._require_fileshed_or_confirm(user_id, __event_emitter__)
+        if not ready:
+            return (
+                "[SUPERPOWERS:FILESHED_REQUIRED]\n\n"
+                "Project initialization paused — Fileshed not detected. "
+                "See the message above. To proceed in standalone mode, call this function again."
+            )
+        if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$', project_slug):
+            return f"[SUPERPOWERS:ERROR] Invalid project_slug '{project_slug}'. Use lowercase letters, numbers, and hyphens only."
+        step_count = max(1, min(10, int(step_count)))
+        project_root = os.path.join(self._superpowers_root(user_id), "projects", project_slug)
+        status_path = os.path.join(project_root, "status", "progress.json")
+        if os.path.exists(status_path):
+            try:
+                with open(status_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            return (
+                f"[SUPERPOWERS:PROJECT:EXISTS]\n\n"
+                f"Project '{project_slug}' already initialized at:\n`{project_root}`\n\n"
+                f"Current step: {existing.get('current_step', 1)}\n"
+                f"Call `spwui_project_status` to resume."
+            )
+        created = []
+        for i in range(1, step_count + 1):
+            step_dir = os.path.join(project_root, f"step{i}")
+            os.makedirs(step_dir, exist_ok=True)
+            stub = (
+                f"# Step {i}: [title]\n\n"
+                f"## Objective\n[What this step accomplishes.]\n\n"
+                f"## Inputs\n[Files or data required before this step.]\n\n"
+                f"## Process\n[Step-by-step actions.]\n\n"
+                f"## Outputs\n[Files this step produces. List exact filenames.]\n\n"
+                f"## Completion Criteria\n[How to determine this step is done.]\n\n"
+                f"## Notes\n[Caveats, edge cases, context.]\n"
+            )
+            ok, _ = self._atomic_write(os.path.join(step_dir, "instructions.md"), stub)
+            if ok:
+                created.append(f"step{i}/instructions.md")
+        os.makedirs(os.path.join(project_root, "status"), exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        progress = {
+            "project": project_slug,
+            "description": description,
+            "created_at": now,
+            "updated_at": now,
+            "current_step": 1,
+            "steps": {f"step{i}": {"status": "pending", "notes": ""} for i in range(1, step_count + 1)},
+        }
+        ok, err = self._atomic_write(status_path, json.dumps(progress, indent=2))
+        if not ok:
+            return f"[SUPERPOWERS:ERROR] Could not write progress.json: {err}"
+        mode_label = "Fileshed-scoped" if self._fileshed_available else "standalone"
+        return (
+            f"[SUPERPOWERS:PROJECT:INITIALIZED] ({mode_label})\n\n"
+            f"**Project:** `{project_slug}`\n"
+            f"**Root:** `{project_root}`\n"
+            f"**Steps:** {step_count}\n\n"
+            f"**Created:**\n"
+            + "\n".join(f"  - `{f}`" for f in created)
+            + f"\n  - `status/progress.json`\n\n"
+            f"Populate each `stepN/instructions.md` with objectives, inputs, outputs, "
+            f"and completion criteria. Then call `spwui_project_step` with action='start'.\n\n"
+            f"**CONSTRAINT:** All output files MUST be written to `{project_root}/stepN/`. "
+            f"Do not write project files anywhere else."
+        )
+
+    async def spwui_project_status(
+        self,
+        project_slug: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+        __messages__: list = None,
+    ) -> str:
+        """
+        Read progress.json and return current project state.
+
+        ALWAYS call this at the start of any session involving a project.
+        Do NOT infer state from conversation history — progress.json is the source of truth.
+        After this returns: read ONLY the instructions.md for current_step.
+        Do NOT read all step files at once — context window exhaustion is a known failure mode.
+
+        Args:
+            project_slug: The project identifier (e.g. 'bidisync-v2').
+        """
+        user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
+        project_root = os.path.join(self._superpowers_root(user_id), "projects", project_slug)
+        status_path = os.path.join(project_root, "status", "progress.json")
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                status = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return (
+                f"[SUPERPOWERS:ERROR] No progress.json for project '{project_slug}'.\n\n"
+                f"Path checked: `{status_path}`\n\n"
+                f"If new: call `spwui_project_init` first."
+            )
+        current = status.get("current_step", 1)
+        steps = status.get("steps", {})
+        instructions_path = os.path.join(project_root, f"step{current}", "instructions.md")
+        lines = [
+            "[SUPERPOWERS:PROJECT:STATUS]\n",
+            f"**Project:** `{project_slug}`",
+            f"**Mode:** {'Fileshed-scoped' if self._fileshed_available else 'standalone'}",
+            f"**Root:** `{project_root}`",
+            f"**Current step:** {current}",
+            f"**Description:** {status.get('description', '(none)')}",
+            f"**Last updated:** {status.get('updated_at', 'unknown')}\n",
+            "**Steps:**",
+        ]
+        icons = {"pending": "⬜", "in_progress": "🔄", "blocked": "🚫", "complete": "✅"}
+        for step_key in sorted(steps.keys()):
+            s = steps[step_key]
+            icon = icons.get(s.get("status", "pending"), "⬜")
+            note = f" — {s['notes']}" if s.get("notes") else ""
+            lines.append(f"  {icon} {step_key}: {s.get('status', 'pending')}{note}")
+        lines.append(
+            f"\n**Next:** Read `{instructions_path}` for step {current}, "
+            f"then call `spwui_project_step` with action='start' and step={current}."
+        )
+        lines.append(
+            f"\n**CONSTRAINT:** Read ONLY step{current}/instructions.md. "
+            f"Do not scan the full project tree."
+        )
+        return "\n".join(lines)
+
+    async def spwui_project_step(
+        self,
+        project_slug: str,
+        step: int,
+        action: str,
+        notes: str = "",
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+        __messages__: list = None,
+    ) -> str:
+        """
+        Update the status of a project step in progress.json.
+        This is the ONLY way to update step status. Never edit progress.json directly.
+
+        HARD CONSTRAINT: Output files go to superpowers/projects/<slug>/step<N>/ ONLY.
+        Do NOT move outputs elsewhere after a step completes.
+
+        Args:
+            project_slug: The project identifier.
+            step:         Step number (1-based).
+            action:       'start', 'complete', or 'block'.
+            notes:        Required when action is 'block'.
+        """
+        user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
+        action_map = {"start": "in_progress", "complete": "complete", "block": "blocked"}
+        if action not in action_map:
+            return f"[SUPERPOWERS:ERROR] Invalid action '{action}'. Use: start, complete, block."
+        if action == "block" and not notes:
+            return "[SUPERPOWERS:ERROR] 'block' requires notes explaining why."
+        project_root = os.path.join(self._superpowers_root(user_id), "projects", project_slug)
+        status_path = os.path.join(project_root, "status", "progress.json")
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                status = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return f"[SUPERPOWERS:ERROR] No progress.json for '{project_slug}'. Call spwui_project_init first."
+        step_key = f"step{step}"
+        now = datetime.now(timezone.utc).isoformat()
+        if "steps" not in status:
+            status["steps"] = {}
+        if step_key not in status["steps"]:
+            status["steps"][step_key] = {"status": "pending", "notes": ""}
+        status["steps"][step_key]["status"] = action_map[action]
+        if notes:
+            status["steps"][step_key]["notes"] = notes
+        if action == "start":
+            status["steps"][step_key]["started_at"] = now
+        if action == "complete":
+            status["steps"][step_key]["completed_at"] = now
+            for sk in sorted(status["steps"].keys()):
+                if status["steps"][sk].get("status") != "complete":
+                    try:
+                        status["current_step"] = int(sk.replace("step", ""))
+                    except ValueError:
+                        pass
+                    break
+        status["updated_at"] = now
+        ok, err = self._atomic_write(status_path, json.dumps(status, indent=2))
+        if not ok:
+            return f"[SUPERPOWERS:ERROR] Could not update progress.json: {err}"
+        step_dir = os.path.join(project_root, f"step{step}")
+        current = status.get("current_step", step)
+        if action == "start":
+            return (
+                f"[SUPERPOWERS:STEP:STARTED]\n\nStep {step} of '{project_slug}' is now **in_progress**.\n\n"
+                f"**Output directory:** `{step_dir}/`\nAll files produced by this step go here. Nowhere else.\n\n"
+                f"Read `{step_dir}/instructions.md` for objectives and completion criteria."
+            )
+        if action == "complete":
+            return (
+                f"[SUPERPOWERS:STEP:COMPLETE]\n\nStep {step} marked **complete**.\n\n"
+                f"**Next step:** {current}\n"
+                f"Call `spwui_project_status` then read `{project_root}/step{current}/instructions.md`.\n\n"
+                f"**CONSTRAINT:** step{step} outputs stay in `{step_dir}/`. Do not move them."
+            )
+        return (
+            f"[SUPERPOWERS:STEP:BLOCKED]\n\nStep {step} is **blocked**.\n\n"
+            f"**Reason:** {notes}\n\nReport to the user. Do not proceed without explicit instruction."
+        )
+
     async def spwui_start_spec(
         self,
         topic_and_summary: str,
@@ -416,6 +738,7 @@ class Tools:
         slug = topic.lower().replace(" ", "-")
         filename = f"{today}-{slug}-design.md"
         user_id = (__user__ or {}).get("id", "") if __user__ else ""
+        self._detect_fileshed(user_id)
         spec_path, storage_mode, zone_relative_path = self._resolve_path(self.valves.SPEC_DIR, filename, user_id)
 
         spec_prompt = f"""You are writing a structured software spec document.
@@ -649,6 +972,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Reviewing spec...", "done": False}})
 
+        user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
         reviewer_system_prompt = """You are a spec document reviewer. Your job is to APPROVE specs, not perfect them.
 
 A spec is ready when a competent developer could implement it without building the wrong thing.
@@ -679,9 +1004,13 @@ Output format:
 
         user_id = (__user__ or {}).get("id", "")
         resolved_path, _, zone_relative_path = self._resolve_path(self.valves.SPEC_DIR, os.path.basename(spec_path), user_id)
-        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else spec_path
+        read_path = resolved_path if (self._fileshed_available and zone_relative_path) else spec_path
         try:
-            with open(read_path, "r", encoding="utf-8") as f:
+            jailed = self._jail_path(read_path, user_id)
+        except ValueError as e:
+            return f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n{e}\n\n[SUPERPOWERS:AUTO-CONTINUE]"
+        try:
+            with open(jailed, "r", encoding="utf-8") as f:
                 spec_content = f.read()
         except OSError as e:
             return (
@@ -797,10 +1126,15 @@ Output format:
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Writing plan...", "done": False}})
         user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
         resolved_spec, _, spec_zone_path = self._resolve_path(self.valves.SPEC_DIR, os.path.basename(spec_path), user_id)
-        read_spec_path = resolved_spec if (self.valves.FILESHED_COMPATIBLE and spec_zone_path) else spec_path
+        read_spec_path = resolved_spec if (self._fileshed_available and spec_zone_path) else spec_path
         try:
-            with open(read_spec_path, "r", encoding="utf-8") as f:
+            jailed = self._jail_path(read_spec_path, user_id)
+        except ValueError as e:
+            return f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n{e}\n\n[SUPERPOWERS:AUTO-CONTINUE]"
+        try:
+            with open(jailed, "r", encoding="utf-8") as f:
                 spec_content = f.read()
         except OSError as e:
             return (
@@ -1054,6 +1388,8 @@ Output ONLY the markdown document. No preamble, no commentary."""
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Reviewing plan...", "done": False}})
 
+        user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
         reviewer_system_prompt = """You are a plan document reviewer. Verify this plan is complete and ready for implementation.
 
 Check for:
@@ -1106,9 +1442,13 @@ Output format:
 
         user_id = (__user__ or {}).get("id", "")
         resolved_path, _, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, os.path.basename(plan_path), user_id)
-        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else plan_path
+        read_path = resolved_path if (self._fileshed_available and zone_relative_path) else plan_path
         try:
-            with open(read_path, "r", encoding="utf-8") as f:
+            jailed = self._jail_path(read_path, user_id)
+        except ValueError as e:
+            return f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n{e}\n\n[SUPERPOWERS:AUTO-CONTINUE]"
+        try:
+            with open(jailed, "r", encoding="utf-8") as f:
                 plan_content = f.read()
         except OSError as e:
             return (
@@ -2249,10 +2589,15 @@ Output format:
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": "Executing task...", "done": False}})
         user_id = (__user__ or {}).get("id", "")
+        self._detect_fileshed(user_id)
         resolved_path, _, zone_relative_path = self._resolve_path(self.valves.PLAN_DIR, os.path.basename(plan_path), user_id)
-        read_path = resolved_path if (self.valves.FILESHED_COMPATIBLE and zone_relative_path) else plan_path
+        read_path = resolved_path if (self._fileshed_available and zone_relative_path) else plan_path
         try:
-            with open(read_path, "r", encoding="utf-8") as f:
+            jailed = self._jail_path(read_path, user_id)
+        except ValueError as e:
+            return f"[SUPERPOWERS:PHASE:FATAL_ERROR]\n\n{e}\n\n[SUPERPOWERS:AUTO-CONTINUE]"
+        try:
+            with open(jailed, "r", encoding="utf-8") as f:
                 plan_content = f.read()
         except OSError as e:
             return (
@@ -2906,7 +3251,7 @@ Output format:
                 return "Cache is empty — nothing to export."
             user_id = (__user__ or {}).get("id", "")
             export_filename = f"skillstack_export_{int(time.time())}.json"
-            if self.valves.FILESHED_COMPATIBLE and user_id:
+            if self._fileshed_available and user_id:
                 export_dir = os.path.join(
                     self.valves.STORAGE_BASE_PATH,
                     "users", user_id, "Storage", "data",
@@ -2930,7 +3275,7 @@ Output format:
                 return f"Export failed: {err}"
             location = (
                 f"Fileshed Storage zone → `{export_filename}`"
-                if self.valves.FILESHED_COMPATIBLE and user_id
+                if self._fileshed_available and user_id
                 else f"`{export_path}`"
             )
             return (
@@ -3010,7 +3355,7 @@ Output format:
 
             if command:
                 # command parameter used as relative file path under user's Storage
-                if self.valves.FILESHED_COMPATIBLE and user_id:
+                if self._fileshed_available and user_id:
                     file_path = os.path.join(
                         self.valves.STORAGE_BASE_PATH,
                         "users", user_id, "Storage", "data",
