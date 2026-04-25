@@ -63,6 +63,15 @@ class Tools:
                 "'disabled' = use flat standalone path, no detection or warning."
             ),
         )
+        FILESHED_PROJECT_ZONE: str = Field(
+            default="storage",
+            description=(
+                "Fileshed zone for all project working files. "
+                "'storage' = personal workspace (recommended, no git auto-commit overhead). "
+                "'documents' = git-versioned zone (use if you want automatic commit history). "
+                "Do NOT change mid-project. All SPWUI file operations use this zone exclusively."
+            ),
+        )
         COMPLEXITY: str = Field(
             default="simple",
             description=(
@@ -146,6 +155,7 @@ class Tools:
         self._batch_mode: bool = None  # None = use valve; True/False = runtime override
         self._fileshed_available: bool = None  # None = not yet probed this session
         self._fileshed_warned: bool = False
+        self._fileshed_zone: str = None  # resolved once from valve, never changes mid-session
         self._ensure_cache_exists()
         self._ensure_docker_folders()
 
@@ -192,6 +202,7 @@ class Tools:
             "and no project management features.\n\n"
             "**To install:** Open WebUI → Workspace → Tools → paste Fileshed.py → Save. "
             "Then enable it on this model.\n\n"
+            f"Active zone (once installed): `{self.valves.FILESHED_PROJECT_ZONE}`\n\n"
             "Would you like to proceed in standalone mode anyway?"
         )
 
@@ -214,6 +225,21 @@ class Tools:
                 "users", user_id, "Storage", "data", "superpowers"
             )
         return os.path.join(self.valves.STORAGE_BASE_PATH, "superpowers")
+
+    def _get_fileshed_zone(self) -> str:
+        """
+        Returns the active Fileshed zone for this session.
+        Resolved once on first call and cached — never changes mid-session.
+        Valid values: 'storage', 'documents'.
+        Falls back to 'storage' on invalid input.
+        """
+        if self._fileshed_zone is not None:
+            return self._fileshed_zone
+        zone = (self.valves.FILESHED_PROJECT_ZONE or "storage").lower().strip()
+        if zone not in ("storage", "documents"):
+            zone = "storage"
+        self._fileshed_zone = zone
+        return self._fileshed_zone
 
     def _jail_path(self, path: str, user_id: str = "") -> str:
         root = os.path.realpath(self._superpowers_root(user_id))
@@ -440,6 +466,14 @@ class Tools:
         Never write project files to specs/, plans/, scratch/, or outside this tree.
         Do not move outputs after a step completes.
 
+        ZONE RULE: All file operations use the zone returned by _get_fileshed_zone().
+        Never move or copy files to a different zone during a session.
+        shed_copy_storage_to_documents is called ONLY at explicit project completion,
+        not during normal step execution. If git commit is needed, use:
+          shed_exec(zone=<active_zone>, cmd="git", args=["commit", ...])
+        Both storage and documents zones support git — do NOT copy to documents
+        just to access git.
+
         Args:
             project_slug: lowercase-with-hyphens identifier (e.g. 'bidisync-v2').
             step_count:   Steps to scaffold (default 3, max 10).
@@ -453,6 +487,7 @@ class Tools:
                 "Project initialization paused — Fileshed not detected. "
                 "See the message above. To proceed in standalone mode, call this function again."
             )
+        zone = self._get_fileshed_zone()
         if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$', project_slug):
             return f"[SUPERPOWERS:ERROR] Invalid project_slug '{project_slug}'. Use lowercase letters, numbers, and hyphens only."
         step_count = max(1, min(10, int(step_count)))
@@ -504,6 +539,7 @@ class Tools:
             f"[SUPERPOWERS:PROJECT:INITIALIZED] ({mode_label})\n\n"
             f"**Project:** `{project_slug}`\n"
             f"**Root:** `{project_root}`\n"
+            f"**Zone:** `{zone}` — all file operations in this zone only. Do not cross zones.\n"
             f"**Steps:** {step_count}\n\n"
             f"**Created:**\n"
             + "\n".join(f"  - `{f}`" for f in created)
@@ -535,11 +571,20 @@ class Tools:
         After this returns: read ONLY the instructions.md for current_step.
         Do NOT read all step files at once — context window exhaustion is a known failure mode.
 
+        ZONE RULE: All file operations use the zone returned by _get_fileshed_zone().
+        Never move or copy files to a different zone during a session.
+        shed_copy_storage_to_documents is called ONLY at explicit project completion,
+        not during normal step execution. If git commit is needed, use:
+          shed_exec(zone=<active_zone>, cmd="git", args=["commit", ...])
+        Both storage and documents zones support git — do NOT copy to documents
+        just to access git.
+
         Args:
             project_slug: The project identifier (e.g. 'bidisync-v2').
         """
         user_id = (__user__ or {}).get("id", "")
         self._detect_fileshed(user_id)
+        zone = self._get_fileshed_zone()
         project_root = os.path.join(self._superpowers_root(user_id), "projects", project_slug)
         status_path = os.path.join(project_root, "status", "progress.json")
         try:
@@ -558,6 +603,7 @@ class Tools:
             "[SUPERPOWERS:PROJECT:STATUS]\n",
             f"**Project:** `{project_slug}`",
             f"**Mode:** {'Fileshed-scoped' if self._fileshed_available else 'standalone'}",
+            f"**Zone:** `{zone}` — all file operations in this zone only. Do not cross zones.",
             f"**Root:** `{project_root}`",
             f"**Current step:** {current}",
             f"**Description:** {status.get('description', '(none)')}",
@@ -603,6 +649,14 @@ class Tools:
         HARD CONSTRAINT: Output files go to superpowers/projects/<slug>/step<N>/ ONLY.
         Do NOT move outputs elsewhere after a step completes.
 
+        ZONE RULE: All file operations use the zone returned by _get_fileshed_zone().
+        Never move or copy files to a different zone during a session.
+        shed_copy_storage_to_documents is called ONLY at explicit project completion,
+        not during normal step execution. If git commit is needed, use:
+          shed_exec(zone=<active_zone>, cmd="git", args=["commit", ...])
+        Both storage and documents zones support git — do NOT copy to documents
+        just to access git.
+
         Args:
             project_slug: The project identifier.
             step:         Step number (1-based).
@@ -611,6 +665,7 @@ class Tools:
         """
         user_id = (__user__ or {}).get("id", "")
         self._detect_fileshed(user_id)
+        zone = self._get_fileshed_zone()
         action_map = {"start": "in_progress", "complete": "complete", "block": "blocked"}
         if action not in action_map:
             return f"[SUPERPOWERS:ERROR] Invalid action '{action}'. Use: start, complete, block."
@@ -652,18 +707,21 @@ class Tools:
         if action == "start":
             return (
                 f"[SUPERPOWERS:STEP:STARTED]\n\nStep {step} of '{project_slug}' is now **in_progress**.\n\n"
+                f"**Zone:** `{zone}` — all file operations in this zone only. Do not cross zones.\n"
                 f"**Output directory:** `{step_dir}/`\nAll files produced by this step go here. Nowhere else.\n\n"
                 f"Read `{step_dir}/instructions.md` for objectives and completion criteria."
             )
         if action == "complete":
             return (
                 f"[SUPERPOWERS:STEP:COMPLETE]\n\nStep {step} marked **complete**.\n\n"
+                f"**Zone:** `{zone}` — outputs remain in this zone.\n"
                 f"**Next step:** {current}\n"
                 f"Call `spwui_project_status` then read `{project_root}/step{current}/instructions.md`.\n\n"
                 f"**CONSTRAINT:** step{step} outputs stay in `{step_dir}/`. Do not move them."
             )
         return (
             f"[SUPERPOWERS:STEP:BLOCKED]\n\nStep {step} is **blocked**.\n\n"
+            f"**Zone:** `{zone}`\n"
             f"**Reason:** {notes}\n\nReport to the user. Do not proceed without explicit instruction."
         )
 
